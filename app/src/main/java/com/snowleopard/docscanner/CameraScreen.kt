@@ -5,6 +5,8 @@ import com.google.accompanist.permissions.isGranted
 import android.Manifest
 import android.view.ViewGroup
 import androidx.camera.core.*
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
@@ -27,6 +29,7 @@ import com.google.accompanist.permissions.rememberPermissionState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asExecutor
 import kotlin.math.max
+import kotlin.math.min
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
@@ -72,7 +75,7 @@ fun CameraScreen(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    scaleType = PreviewView.ScaleType.FILL_CENTER // center-crop
+                    scaleType = PreviewView.ScaleType.FIT_CENTER // center-crop
                     previewView = this
                 }
             },
@@ -80,16 +83,24 @@ fun CameraScreen(
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
                 cameraProviderFuture.addListener({
                     val cameraProvider = cameraProviderFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.setSurfaceProvider(pv.surfaceProvider)
-                    }
+
+                    val rotation = pv.display.rotation
+                    val resolutionSelector = ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                        .build()
+
+                    val preview = Preview.Builder()
+                        .setResolutionSelector(resolutionSelector)
+                        .setTargetRotation(rotation)
+                        .build().also {
+                            it.surfaceProvider = pv.surfaceProvider
+                        }
 
                     val analyzer = ImageAnalysis.Builder()
+                        .setResolutionSelector(resolutionSelector)
+                        .setTargetRotation(rotation)
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        // Не форсим разрешение — пусть подберётся под устройство
-                        //.setTargetResolution(Size(1280, 720))
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                         .build().also { analysis ->
                             analysis.setAnalyzer(
                                 Dispatchers.Default.asExecutor(),
@@ -142,7 +153,7 @@ fun CameraScreen(
             val poly = polygonRaw
             if (src != null && poly.size >= 4 && viewW > 0 && viewH > 0) {
                 val (srcW, srcH) = src
-                val scale = max(viewW.toFloat() / srcW, viewH.toFloat() / srcH)
+                val scale = min(viewW.toFloat() / srcW, viewH.toFloat() / srcH)
                 val dx = (viewW - srcW * scale) / 2f
                 val dy = (viewH - srcH * scale) / 2f
 
