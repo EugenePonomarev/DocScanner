@@ -75,6 +75,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.play.services)
 
     implementation(libs.accompanist.permissions)
+    implementation(libs.ui.graphics)
 
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 

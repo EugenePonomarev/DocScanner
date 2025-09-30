@@ -46,7 +46,7 @@ fun CameraScreen(
 
     if (!cameraPermission.status.isGranted) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Нужно разрешение камеры")
+            Text("Camera permission required")
         }
         return
     }
@@ -104,7 +104,7 @@ fun CameraScreen(
                         .build().also { analysis ->
                             analysis.setAnalyzer(
                                 Dispatchers.Default.asExecutor(),
-                                DocumentAnalyzer(
+                                DocumentAnalyzerTwo(
                                     onFrameSize = { w, h -> viewModel.setFrameSize(w, h) },
                                     onDebug = { bmp, text ->
                                         viewModel.setDebugFrame(bmp)
@@ -189,7 +189,7 @@ fun CameraScreen(
             Button(
                 onClick = { onSave() },
                 enabled = viewModel.finalDoc.collectAsState().value != null
-            ) { Text("Сохранить") }
+            ) { Text("Save") }
         }
     }
 }
