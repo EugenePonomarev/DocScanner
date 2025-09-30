@@ -74,8 +74,15 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.play.services)
 
+    //permissions
     implementation(libs.accompanist.permissions)
+
+    //graphics
     implementation(libs.ui.graphics)
+
+    // koin
+    implementation(libs.koin.android)
+    implementation(libs.koin.androidx.compose)
 
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 
