@@ -310,29 +310,31 @@ class DocumentAnalyzerOne(
     }
 
     private fun warpByQuad(src: Bitmap, quad: Array<Point>): Bitmap? {
-        // target rectangle - by quad orientation
-        val wA = dist(quad[1], quad[2])
-        val wB = dist(quad[0], quad[3])
-        val hA = dist(quad[0], quad[1])
-        val hB = dist(quad[3], quad[2])
-        val width = max(wA, wB).roundToInt().coerceAtLeast(200)
-        val height = max(hA, hB).roundToInt().coerceAtLeast(200)
+        val widthTop = dist(quad[0], quad[1])      // TL-TR
+        val widthBottom = dist(quad[3], quad[2])   // BL-BR
+        val heightLeft = dist(quad[0], quad[3])    // TL-BL
+        val heightRight = dist(quad[1], quad[2])   // TR-BR
 
-        val srcMat = Mat(); Utils.bitmapToMat(src, srcMat)
+        val width = max(widthTop, widthBottom).roundToInt().coerceAtLeast(200)
+        val height = max(heightLeft, heightRight).roundToInt().coerceAtLeast(200)
+
+        val srcMat = Mat().also { Utils.bitmapToMat(src, it) }
         val dst = Mat()
 
-        val srcPts = MatOfPoint2f(quad[0], quad[1], quad[2], quad[3])
+        val srcPts = MatOfPoint2f(quad[0], quad[1], quad[2], quad[3]) // TL,TR,BR,BL
         val dstPts = MatOfPoint2f(
             Point(0.0, 0.0),
             Point(width - 1.0, 0.0),
             Point(width - 1.0, height - 1.0),
             Point(0.0, height - 1.0)
         )
-        val mat = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-        Imgproc.warpPerspective(srcMat, dst, mat, Size(width.toDouble(), height.toDouble()))
+        val m = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+        Imgproc.warpPerspective(srcMat, dst, m, Size(width.toDouble(), height.toDouble()))
 
         val out = createBitmap(width, height)
         Utils.matToBitmap(dst, out)
+
+        srcMat.release(); dst.release(); srcPts.release(); dstPts.release(); m.release()
         return out
     }
 

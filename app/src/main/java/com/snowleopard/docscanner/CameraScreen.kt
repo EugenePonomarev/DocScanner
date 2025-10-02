@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.Animatable
@@ -46,6 +47,7 @@ import kotlin.math.min
 @Composable
 fun CameraScreen(
     viewModel: ScanViewModel = koinViewModel(),
+    onOpenStack: () -> Unit,
 ) {
     val cameraPermission = rememberPermissionState(Manifest.permission.CAMERA)
     val context = LocalContext.current
@@ -140,6 +142,7 @@ fun CameraScreen(
                     val rotation = pv.display.rotation
                     val resolutionSelector = ResolutionSelector.Builder()
                         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                        .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
                         .build()
 
                     val preview = Preview.Builder()
@@ -382,9 +385,7 @@ fun CameraScreen(
                 Box(
                     modifier = Modifier
                         .size(72.dp)
-                        .clickable {
-                            // Экран-стопка — в Шаге 3.
-                        }
+                        .clickable { onOpenStack() }
                 ) {
                     val tail = pages.takeLast(3)
                     tail.forEachIndexed { idx, page ->

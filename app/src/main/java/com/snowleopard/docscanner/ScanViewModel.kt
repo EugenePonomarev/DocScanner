@@ -1,5 +1,6 @@
 package com.snowleopard.docscanner
 
+import android.content.Context
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -8,18 +9,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.sqrt
-import androidx.core.graphics.scale
 
 class ScanViewModel(
-    private val repo: PagesRepository,
+    private val repo: PagesRepository
 ) : ViewModel() {
 
-    // ---------- Live overlay ----------
+    // ----- Live overlay -----
     private val _livePreviewPolygon = MutableStateFlow<List<Pair<Float, Float>>>(emptyList())
     val livePreviewPolygon = _livePreviewPolygon.asStateFlow()
 
@@ -29,18 +30,16 @@ class ScanViewModel(
     private val _frameSize = MutableStateFlow<Pair<Int, Int>?>(null)
     val frameSize = _frameSize.asStateFlow()
 
-    // DEBUG
     private val _debugFrame = MutableStateFlow<Bitmap?>(null)
     val debugFrame = _debugFrame.asStateFlow()
 
     private val _status = MutableStateFlow("")
     val status = _status.asStateFlow()
 
-    // ---------- Session ----------
+    // ----- Session -----
     private val _pages = MutableStateFlow<List<ScannedPage>>(emptyList())
     val pages = _pages.asStateFlow()
 
-    // UI flags
     private val _captureInProgress = MutableStateFlow(false)
     val captureInProgress = _captureInProgress.asStateFlow()
 
@@ -50,30 +49,27 @@ class ScanViewModel(
     private val _wavePolygon = MutableStateFlow<List<Pair<Float, Float>>>(emptyList())
     val wavePolygon = _wavePolygon.asStateFlow()
 
-    // ---------- Freeze-гейт после захвата ----------
+    // Freeze/duplicate FSM (сокр. — как в последней версии)
     private val _captureFreeze = MutableStateFlow(false)
     val captureFreeze = _captureFreeze.asStateFlow()
-
     private var frozenAt: Long = 0L
     private var framesWithoutDoc: Int = 0
 
-    // ---------- Сигнатура последнего захвата (анти-дубликат «умный») ----------
     private data class CaptureSig(
         val hash: Long,
         val time: Long,
-        val centroidN: Pair<Float, Float>, // нормализованный центр квада (0..1 относительно диагонали)
-        val areaN: Float,                    // площадь полигона / площадь кадра
+        val centroidN: Pair<Float, Float>,
+        val areaN: Float
     )
     private var lastSig: CaptureSig? = null
 
     private var lastPolyAreaNorm: Float = 0f
     private var lastPolyCentroid: Pair<Float, Float>? = null
 
-    // ---------- Lock-процесс перед захватом ----------
-    private val _lockProgress = MutableStateFlow(0f) // 0..1
+    private val _lockProgress = MutableStateFlow(0f)
     val lockProgress = _lockProgress.asStateFlow()
 
-    private val _confirmAt = MutableStateFlow(0L) // метка времени начала confirm-анимации
+    private val _confirmAt = MutableStateFlow(0L)
     val confirmAt = _confirmAt.asStateFlow()
 
     private var prevPoly: List<Pair<Float, Float>>? = null
@@ -82,7 +78,7 @@ class ScanViewModel(
     private var latestCropped: Bitmap? = null
     private var latestCroppedAt: Long = 0L
 
-    // ---------- Параметры — «плавный» режим ----------
+    // Параметры (как договорились — «плавнее»)
     private val captureCooldownMs = 1400L
     private val minFreezeMs = 1600L
     private val requireDocAbsenceFrames = 5
@@ -98,16 +94,14 @@ class ScanViewModel(
     private val confirmDurationMs = 650L
     private val acceptStalenessMs = 900L
 
-    // Анти-дубликат
-    private val dupTimeWindowMs = 2000L          // дубль блокируем только в первые 2с
-    private val dupHashHammingThresh = 5         // порог близости хэшей
-    private val dupCentroidShiftThresh = 0.03f   // <3% диагонали — считаем тем же положением
-    private val dupAreaRelDiffThresh = 0.12f     // <12% относительное отличие площади
+    private val dupTimeWindowMs = 2000L
+    private val dupHashHammingThresh = 5
+    private val dupCentroidShiftThresh = 0.03f
+    private val dupAreaRelDiffThresh = 0.12f
 
     fun setStatus(s: String) { _status.value = s }
     fun setDebugFrame(bmp: Bitmap?) { _debugFrame.value = bmp }
     fun setFrameSize(w: Int, h: Int) { _frameSize.value = w to h }
-
     fun updateOverlay(polygon: List<Pair<Float, Float>>, thumb: Bitmap?) {
         _livePreviewPolygon.value = polygon
         if (thumb != null) _liveThumbnail.value = thumb
@@ -115,12 +109,10 @@ class ScanViewModel(
 
     fun onAnalyzerResult(polygon: List<Pair<Float, Float>>, cropped: Bitmap?, thumbnail: Bitmap?) {
         updateOverlay(polygon, thumbnail)
-
         if (cropped != null) {
             latestCropped = cropped
             latestCroppedAt = System.currentTimeMillis()
         }
-
         if (!_captureFreeze.value) {
             updateLockProgress(polygon)
             checkConfirmAndCapture()
@@ -130,8 +122,6 @@ class ScanViewModel(
         }
     }
 
-    // ---------- Locking / Confirm ----------
-
     private fun updateLockProgress(poly: List<Pair<Float, Float>>) {
         val fs = _frameSize.value ?: return
         if (poly.size < 4) {
@@ -140,15 +130,12 @@ class ScanViewModel(
             _lockProgress.value = max(0f, _lockProgress.value - lockDecay)
             return
         }
-
         val (w, h) = fs
         val diag = hypot(w.toDouble(), h.toDouble()).toFloat().coerceAtLeast(1f)
-
         val areaNorm = (polygonArea(poly) / (w.toFloat() * h.toFloat())).coerceIn(0f, 1f)
         val centroid = polygonCentroid(poly)
         val angles = rightAngleScore(poly)
         val aspect = aspectA4Score(poly)
-
         val moved = prevPoly?.let { distance(centroid, polygonCentroid(it)) / diag } ?: 1f
 
         val geometryOk = angles >= angleMin && aspect >= aspectMin && areaNorm >= areaMinNorm
@@ -192,43 +179,26 @@ class ScanViewModel(
 
         _captureInProgress.value = true
         viewModelScope.launch {
-            // Готовим новый хэш и метрики сцены
             val newHash = withContext(Dispatchers.Default) { averageHash64(cropped) }
             val metrics = currentPolyMetrics(polygonForWave)
-
-            // Анти-дубликат: только если это очень быстро после предыдущего
             val duplicate = isLikelyDuplicate(newHash, metrics, now)
-
             if (!duplicate) {
                 val page = withContext(Dispatchers.Default) {
-                    repo.savePage(cropped, preferPortraitA4 = true)
+                    repo.savePage(cropped, preferPortrait = true)
                 }
                 _wavePolygon.value = polygonForWave
                 _lastCapturedAt.value = now
                 _pages.value = _pages.value + page
-
-                // freeze + запоминаем сигнатуру (для защиты от мгновенных дублей)
-                enableFreeze(
-                    CaptureSig(
-                        hash = newHash,
-                        time = now,
-                        centroidN = metrics.centroidN,
-                        areaN = metrics.areaN
-                    )
-                )
+                enableFreeze(CaptureSig(newHash, now, metrics.centroidN, metrics.areaN))
             }
             _captureInProgress.value = false
         }
     }
 
-    // ---------- Freeze / Unfreeze ----------
-
     private fun enableFreeze(sig: CaptureSig) {
         _captureFreeze.value = true
         frozenAt = System.currentTimeMillis()
         framesWithoutDoc = 0
-
-        // Обновляем "последнюю сигнатуру"
         lastSig = sig
     }
 
@@ -237,42 +207,29 @@ class ScanViewModel(
         if (System.currentTimeMillis() - frozenAt < minFreezeMs) return
 
         val fs = _frameSize.value
-
         val hasDoc = currentPoly.size >= 4
         if (!hasDoc) {
             framesWithoutDoc++
-            if (framesWithoutDoc >= requireDocAbsenceFrames) {
-                disableFreeze(resetSignature = true) // документ пропал → точно новый ожидаем
-            }
+            if (framesWithoutDoc >= requireDocAbsenceFrames) disableFreeze(true)
             return
         } else framesWithoutDoc = 0
 
-        // Снимаем фриз при явном изменении сцены (сильный сдвиг/масштаб)
         if (fs != null && lastPolyCentroid != null) {
             val (w, h) = fs
             val diag = hypot(w.toDouble(), h.toDouble()).toFloat().coerceAtLeast(1f)
-
             val curAreaNorm = (polygonArea(currentPoly) / (w.toFloat() * h.toFloat())).coerceIn(0f, 1f)
             val curCentroid = polygonCentroid(currentPoly)
-
             val shift = distance(curCentroid, lastPolyCentroid!!) / diag
             val areaRelChange = if (lastPolyAreaNorm > 1e-6f)
-                abs(curAreaNorm - lastPolyAreaNorm) / lastPolyAreaNorm
-            else 1f
-
-            if (shift > 0.10f || areaRelChange > 0.25f) {
-                // сцена заметно изменилась → сбросим фриз и старую сигнатуру
-                disableFreeze(resetSignature = true)
-            }
+                abs(curAreaNorm - lastPolyAreaNorm) / lastPolyAreaNorm else 1f
+            if (shift > 0.10f || areaRelChange > 0.25f) disableFreeze(true)
         }
     }
 
     private fun disableFreeze(resetSignature: Boolean) {
         _captureFreeze.value = false
         framesWithoutDoc = 0
-        if (resetSignature) {
-            lastSig = null // ключевой момент: не держим прошлый хэш слишком долго
-        }
+        if (resetSignature) lastSig = null
     }
 
     fun removeLastPage() {
@@ -295,8 +252,6 @@ class ScanViewModel(
                 _liveThumbnail.value = null
                 _wavePolygon.value = emptyList()
                 _lastCapturedAt.value = 0L
-
-                // сброс FSM/сигнатур
                 _captureFreeze.value = false
                 framesWithoutDoc = 0
                 prevPoly = null
@@ -309,50 +264,71 @@ class ScanViewModel(
         }
     }
 
-    // ---------- Анти-дубликат: эвристика «быстрый тот же самый» ----------
-    private data class PolyMetrics(
-        val centroidN: Pair<Float, Float>,
-        val areaN: Float,
-    )
+    // ----- STACK ACTIONS -----
 
+    fun movePage(from: Int, to: Int) {
+        if (from == to) return
+        val list = _pages.value.toMutableList()
+        if (from !in list.indices || to !in list.indices) return
+        val it = list.removeAt(from)
+        list.add(to, it)
+        _pages.value = list
+    }
+
+    fun deletePageAt(index: Int) {
+        val list = _pages.value
+        if (index !in list.indices) return
+        val page = list[index]
+        viewModelScope.launch(Dispatchers.IO) {
+            repo.deletePage(page)
+            withContext(Dispatchers.Main) {
+                _pages.value = list.toMutableList().apply { removeAt(index) }
+            }
+        }
+    }
+
+    fun rotatePage(index: Int, degrees: Int) {
+        val list = _pages.value
+        if (index !in list.indices) return
+        val page = list[index]
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = repo.rotatePage(page, degrees)
+            withContext(Dispatchers.Main) {
+                _pages.value = list.toMutableList().apply { set(index, updated) }
+            }
+        }
+    }
+
+    suspend fun buildPdf(options: PdfOptions): File {
+        val current = pages.value // snapshot
+        return repo.buildPdf(current, options)
+    }
+
+    // ----- Utils for duplicate -----
+    private data class PolyMetrics(val centroidN: Pair<Float, Float>, val areaN: Float)
     private fun currentPolyMetrics(poly: List<Pair<Float, Float>>): PolyMetrics {
         val fs = _frameSize.value
         val (w, h) = fs ?: (1 to 1)
         val areaN = (polygonArea(poly) / (w.toFloat() * h.toFloat())).coerceIn(0f, 1f)
         val centroid = polygonCentroid(poly)
         val diag = hypot(w.toDouble(), h.toDouble()).toFloat().coerceAtLeast(1f)
-        // Нормализуем центр по диагонали: (x/diag, y/diag)
         val cxN = centroid.first / diag
         val cyN = centroid.second / diag
-        return PolyMetrics(centroidN = cxN to cyN, areaN = areaN)
+        return PolyMetrics(cxN to cyN, areaN)
     }
 
     private fun isLikelyDuplicate(newHash: Long, metrics: PolyMetrics, now: Long): Boolean {
         val sig = lastSig ?: return false
-        // Дубли блокируем только в коротком окне после предыдущего захвата
         if (now - sig.time > dupTimeWindowMs) return false
-
         val hamming = hammingDistance(newHash, sig.hash)
-        val dCentroid = sqrt(
+        val dc = sqrt(
             (metrics.centroidN.first - sig.centroidN.first) * (metrics.centroidN.first - sig.centroidN.first) +
                     (metrics.centroidN.second - sig.centroidN.second) * (metrics.centroidN.second - sig.centroidN.second)
         )
-        val areaRelDiff = if (sig.areaN > 1e-6f)
-            abs(metrics.areaN - sig.areaN) / sig.areaN
-        else 1f
-
-        val isDup = (hamming <= dupHashHammingThresh) &&
-                (dCentroid < dupCentroidShiftThresh) &&
-                (areaRelDiff < dupAreaRelDiffThresh)
-
-        if (isDup) {
-            // Можно писать статус/лог, если нужно
-            // setStatus("duplicate skipped (h=$hamming, dc=%.3f, da=%.2f)".format(dCentroid, areaRelDiff))
-        }
-        return isDup
+        val da = if (sig.areaN > 1e-6f) abs(metrics.areaN - sig.areaN) / sig.areaN else 1f
+        return (hamming <= dupHashHammingThresh) && (dc < dupCentroidShiftThresh) && (da < dupAreaRelDiffThresh)
     }
 
-    // ---------- Геометрия/оценки ----------
     private fun polygonArea(poly: List<Pair<Float, Float>>): Float {
         var s = 0f
         for (i in poly.indices) {
@@ -364,9 +340,7 @@ class ScanViewModel(
     }
 
     private fun polygonCentroid(poly: List<Pair<Float, Float>>): Pair<Float, Float> {
-        var cx = 0f
-        var cy = 0f
-        var a = 0f
+        var cx = 0f; var cy = 0f; var a = 0f
         for (i in poly.indices) {
             val (x1, y1) = poly[i]
             val (x2, y2) = poly[(i + 1) % poly.size]
@@ -398,7 +372,6 @@ class ScanViewModel(
             val cos = (dot / max(1e-6, norm)).coerceIn(-1.0, 1.0)
             return Math.toDegrees(acos(cos))
         }
-
         val p = poly
         if (p.size < 4) return 0.0
         val angs = listOf(
@@ -422,9 +395,8 @@ class ScanViewModel(
         return (1.0 - (diff / 0.8f)).coerceIn(0.0, 1.0)
     }
 
-    // ---------- Average Hash (64-bit) ----------
     private fun averageHash64(bmp: Bitmap): Long {
-        val small = bmp.scale(8, 8)
+        val small = Bitmap.createScaledBitmap(bmp, 8, 8, true)
         val pixels = IntArray(64)
         small.getPixels(pixels, 0, 8, 0, 0, 8, 8)
         var sum = 0
@@ -446,6 +418,5 @@ class ScanViewModel(
         small.recycle()
         return hash
     }
-
     private fun hammingDistance(a: Long, b: Long): Int = java.lang.Long.bitCount(a xor b)
 }
