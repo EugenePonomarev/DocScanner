@@ -34,7 +34,7 @@ It detects document edges (OpenCV) in real time, applies perspective warp, auto-
 - **PDF builder** (A4 portrait/landscape per page, DPI & margins)
 - **Share** as PDF or multiple JPEGs (FileProvider)
 - **Offline** processing (no network)
-- **Localization**: EN (default), RU
+- **Localization**: EN 
 
 ---
 
@@ -49,7 +49,7 @@ It detects document edges (OpenCV) in real time, applies perspective warp, auto-
 - **DI:** Koin
 - **Async:** Kotlin Coroutines
 - **PDF:** `android.graphics.pdf.PdfDocument`
-- **Permissions:** `ActivityResultContracts.RequestPermission`
+- **Permissions:** `accompanist-permissions`
 - **SDKs:** minSdk 26 / targetSdk 36
 - **Build:** AGP 8.12.3, Gradle 8.13
 
