@@ -1,3 +1,30 @@
 <resources>
     <string name="app_name">Doc Scanner</string>
+
+    <!-- Common -->
+    <string name="back">Back</string>
+    <string name="clear">Clear</string>
+    <string name="undo">Undo</string>
+    <string name="no_preview">No preview</string>
+    <string name="added_colon">Added: %1$d</string>
+    <string name="page_counter">Page %1$d / %2$d</string>
+
+    <!-- Camera -->
+    <string name="camera_permission_required">Camera permission is required to scan documents.</string>
+    <string name="focusing_on_document">Focusing on document…</string>
+
+    <!-- Stack -->
+    <string name="documents_title">Documents (%1$d)</string>
+    <string name="close_and_clear">Close &amp; clear</string>
+    <string name="share_jpg">Share JPG</string>
+    <string name="build_pdf">Build PDF</string>
+    <string name="share_pdf">Share PDF</string>
+    <string name="build_pdf_failed">Failed to build PDF</string>
+    <string name="no_pages">No pages</string>
+    <string name="rotate">Rotate</string>
+    <string name="delete">Delete</string>
+
+    <!-- Share chooser titles -->
+    <string name="share_images_title">Share images</string>
+    <string name="share_pdf_title">Share PDF</string>
 </resources>

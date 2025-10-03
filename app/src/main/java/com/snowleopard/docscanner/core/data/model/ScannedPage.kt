@@ -1,4 +1,4 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.core.data.model
 
 import java.io.File
 

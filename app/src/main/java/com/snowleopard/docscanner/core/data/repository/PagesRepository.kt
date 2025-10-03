@@ -1,21 +1,17 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.core.data.repository
 
 import android.content.Context
 import android.graphics.*
+import android.graphics.pdf.PdfDocument
 import android.os.Environment
 import androidx.core.graphics.scale
+import com.snowleopard.docscanner.core.data.model.PdfOptions
+import com.snowleopard.docscanner.core.data.model.ScannedPage
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
 import kotlin.math.max
 import kotlin.math.roundToInt
-
-data class PdfOptions(
-    val dpi: Int = 200,                 // качество/вес
-    val marginMm: Int = 6,              // поля
-    val jpegQuality: Int = 90,          // качество рендера
-    val autoRotateToPortrait: Boolean = false, // ❌ по умолчанию НЕ крутим контент
-)
 
 class PagesRepository(private val context: Context) {
 
@@ -29,9 +25,6 @@ class PagesRepository(private val context: Context) {
 
     fun getSessionDir(): File = sessionDir
 
-    /**
-     * Сохраняем страницу как есть. НИКАКОЙ авто-ориентации.
-     */
     fun savePage(original: Bitmap, preferPortrait: Boolean = false): ScannedPage {
         val maxSide = 3000
         var bmp = original
@@ -49,7 +42,6 @@ class PagesRepository(private val context: Context) {
             bmp.compress(Bitmap.CompressFormat.JPEG, 92, fos)
         }
 
-        // Превью 240px по ширине
         val thumbW = 240
         val r = thumbW.toFloat() / bmp.width
         val th = (bmp.height * r).toInt().coerceAtLeast(1)
@@ -82,28 +74,33 @@ class PagesRepository(private val context: Context) {
     fun decodeThumb(page: ScannedPage): Bitmap? =
         BitmapFactory.decodeFile(page.thumbFile.absolutePath)
 
-    // Поворот файла страницы (перезаписываем и thumb)
     fun rotatePage(page: ScannedPage, degrees: Int): ScannedPage {
         val src = BitmapFactory.decodeFile(page.file.absolutePath) ?: return page
-        val m = Matrix().apply { postRotate(degrees.toFloat()) }
-        val rot = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
 
-        FileOutputStream(page.file).use { rot.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
 
+        // overwrite page
+        FileOutputStream(page.file).use { rotated.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+        page.file.setLastModified(System.currentTimeMillis())
+
+        // overwrite thumb
         val thumbW = 240
-        val r = thumbW.toFloat() / rot.width
-        val th = (rot.height * r).roundToInt().coerceAtLeast(1)
-        val thumb = rot.scale(thumbW, th)
+        val r = thumbW.toFloat() / rotated.width.toFloat()
+        val th = (rotated.height * r).roundToInt().coerceAtLeast(1)
+        val thumb = rotated.scale(thumbW, th)
         FileOutputStream(page.thumbFile).use { thumb.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+        page.thumbFile.setLastModified(System.currentTimeMillis())
 
-        return page.copy(width = rot.width, height = rot.height)
+        // free bitmaps
+        if (!src.isRecycled) src.recycle()
+        if (!rotated.isRecycled) rotated.recycle()
+        if (!thumb.isRecycled) thumb.recycle()
+
+        // return updated dims so StateFlow emits new object
+        return page.copy(width = rotated.width, height = rotated.height)
     }
 
-    /**
-     * PDF: сохраняем ориентацию каждой страницы КАК ЕСТЬ.
-     * Если картинка альбомная — создаём альбомную PDF-страницу.
-     * Никаких автоповоротов (кроме явного включения флагом).
-     */
     fun buildPdf(pages: List<ScannedPage>, options: PdfOptions): File {
         require(pages.isNotEmpty()) { "pages is empty" }
 
@@ -112,9 +109,8 @@ class PagesRepository(private val context: Context) {
         if (!outDir.exists()) outDir.mkdirs()
 
         val outFile = File(outDir, "Scan_${System.currentTimeMillis()}.pdf")
-        val pdf = android.graphics.pdf.PdfDocument()
+        val pdf = PdfDocument()
 
-        // A4 базовый размер (портрет)
         val a4W = (8.27f * options.dpi).roundToInt()
         val a4H = (11.69f * options.dpi).roundToInt()
         val margin = mmToPx(options.marginMm, options.dpi)
@@ -122,8 +118,6 @@ class PagesRepository(private val context: Context) {
         pages.forEachIndexed { idx, p ->
             val raw = BitmapFactory.decodeFile(p.file.absolutePath) ?: return@forEachIndexed
 
-            // autoRotateToPortrait=false -> оставляем как есть,
-            // true -> поворачиваем в портрет при необходимости
             val bmp = if (options.autoRotateToPortrait && raw.width > raw.height) {
                 rotate(raw, 90f)
             } else raw
@@ -132,14 +126,12 @@ class PagesRepository(private val context: Context) {
             val pageW = if (isPortrait) a4W else a4H
             val pageH = if (isPortrait) a4H else a4W
 
-            val pageInfo = android.graphics.pdf.PdfDocument.PageInfo.Builder(pageW, pageH, idx + 1).create()
+            val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, idx + 1).create()
             val page = pdf.startPage(pageInfo)
             val canvas = page.canvas
 
-            // Белый фон
             canvas.drawColor(Color.WHITE)
 
-            // Контентная область
             val cx = margin
             val cy = margin
             val cw = pageW - margin * 2

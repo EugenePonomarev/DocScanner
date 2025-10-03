@@ -1,4 +1,4 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.feature.screens
 
 import android.Manifest
 import android.graphics.BitmapFactory
@@ -35,17 +35,23 @@ import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
+import com.snowleopard.docscanner.core.imaging.DocumentAnalyzerTwo
+import com.snowleopard.docscanner.feature.viewmodels.ScanViewModel
 import kotlinx.coroutines.delay
 import org.koin.androidx.compose.koinViewModel
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.min
+import com.snowleopard.docscanner.R
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
@@ -63,7 +69,7 @@ fun CameraScreen(
     }
     if (!cameraPermission.status.isGranted) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Требуется разрешение камеры")
+            Text(stringResource(R.string.camera_permission_required))
         }
         return
     }
@@ -81,8 +87,8 @@ fun CameraScreen(
     val lockProgress by viewModel.lockProgress.collectAsState()
     val confirmAt by viewModel.confirmAt.collectAsState()
 
-    var viewW by remember { mutableStateOf(0) }
-    var viewH by remember { mutableStateOf(0) }
+    var viewW by remember { mutableIntStateOf(0) }
+    var viewH by remember { mutableIntStateOf(0) }
 
     // PreviewView + executor
     val previewView = remember {
@@ -97,7 +103,6 @@ fun CameraScreen(
     }
     val cameraExecutor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
 
-    // Bind once
     DisposableEffect(lifecycleOwner) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         val cameraProvider = cameraProviderFuture.get()
@@ -127,7 +132,6 @@ fun CameraScreen(
             .setTargetRotation(rotation)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setImageQueueDepth(2)
-            // 🔑 Гарантируем формат YUV 420, чтобы цветовая конвертация не падала:
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
 
@@ -156,8 +160,7 @@ fun CameraScreen(
         }
     }
 
-    // ===== UI — твой, без потерь =====
-
+    // UI state
     var showAdded by remember(lastCapturedAt) { mutableStateOf(lastCapturedAt != 0L) }
     LaunchedEffect(lastCapturedAt) {
         if (lastCapturedAt == 0L) return@LaunchedEffect
@@ -223,14 +226,15 @@ fun CameraScreen(
                     trackColor = Color.White.copy(alpha = 0.25f)
                 )
                 Spacer(Modifier.height(2.dp))
-                Text("Фокусируемся на документе…", color = Color.White)
+                Text(stringResource(R.string.focusing_on_document), color = Color.White)
             }
             if (pages.isNotEmpty() && lastCapturedAt != 0L) {
                 Spacer(Modifier.height(6.dp))
-                AssistChip(onClick = {}, label = { Text("Добавлено: ${pages.size}") })
+                AssistChip(onClick = {}, label = { Text(stringResource(R.string.added_colon, pages.size)) })
             }
         }
 
+        // Polygon and effects
         Canvas(Modifier.fillMaxSize()) {
             val src = frameSize
             val poly = polygonRaw
@@ -301,6 +305,7 @@ fun CameraScreen(
             }
         }
 
+        // Flying thumbnail animation
         if (animBmp != null && viewW > 0 && viewH > 0) {
             val p = animProgress.value.coerceIn(0f, 1f)
             val aspect = animBmp!!.width.toFloat() / animBmp!!.height.toFloat()
@@ -335,6 +340,7 @@ fun CameraScreen(
             )
         }
 
+        // Debug/mini panel
         Row(
             Modifier
                 .align(Alignment.BottomStart)
@@ -347,10 +353,11 @@ fun CameraScreen(
             if (mini != null) {
                 Image(bitmap = mini.asImageBitmap(), contentDescription = null, modifier = Modifier.size(88.dp))
             } else {
-                Text("Нет предпросмотра", color = Color.White)
+                Text(stringResource(R.string.no_preview), color = Color.White)
             }
         }
 
+        // Stack entry & undo
         Column(
             Modifier
                 .align(Alignment.BottomEnd)
@@ -361,7 +368,7 @@ fun CameraScreen(
                 FilledTonalButton(
                     onClick = { viewModel.removeLastPage() },
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                ) { Text("↩ Отменить") }
+                ) { Text(stringResource(R.string.undo)) }
                 Spacer(Modifier.height(10.dp))
             }
 
@@ -374,19 +381,20 @@ fun CameraScreen(
                     val tail = pages.takeLast(3)
                     tail.forEachIndexed { idx, page ->
                         val offset = (tail.size - 1 - idx) * 6
-                        val bmp by remember(page.thumbFile) {
-                            mutableStateOf(BitmapFactory.decodeFile(page.thumbFile.absolutePath))
-                        }
-                        if (bmp != null) {
-                            Image(
-                                bitmap = bmp!!.asImageBitmap(),
-                                contentDescription = null,
-                                modifier = Modifier
-                                    .matchParentSize()
-                                    .padding(all = offset.dp)
-                                    .background(Color.Black.copy(alpha = 0.12f), shape = MaterialTheme.shapes.small)
-                            )
-                        }
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(page.thumbFile)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = null,
+                            modifier = Modifier
+                                .matchParentSize()
+                                .padding(all = offset.dp)
+                                .background(
+                                    Color.Black.copy(alpha = 0.12f),
+                                    shape = MaterialTheme.shapes.small
+                                )
+                        )
                     }
                     Box(
                         modifier = Modifier
@@ -408,7 +416,7 @@ fun CameraScreen(
             TextButton(
                 onClick = { viewModel.clearSession() },
                 modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
-            ) { Text("Очистить") }
+            ) { Text(stringResource(R.string.clear)) }
         }
     }
 }

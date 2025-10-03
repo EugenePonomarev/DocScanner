@@ -1,4 +1,4 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.app
 
 import android.app.Application
 import com.snowleopard.docscanner.di.appModule

@@ -1,22 +1,28 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.feature.viewmodels
 
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.snowleopard.docscanner.core.data.repository.PagesRepository
+import com.snowleopard.docscanner.core.data.store.PagesStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.sqrt
+import androidx.core.graphics.scale
+import com.snowleopard.docscanner.core.data.model.ScannedPage
+import kotlinx.coroutines.flow.StateFlow
 
 class ScanViewModel(
-    private val repo: PagesRepository
+    private val repo: PagesRepository,
+    private val store: PagesStore,
 ) : ViewModel() {
 
     // ----- Live overlay -----
@@ -35,10 +41,9 @@ class ScanViewModel(
     private val _status = MutableStateFlow("")
     val status = _status.asStateFlow()
 
-    // ----- Session -----
-    private val _pages = MutableStateFlow<List<ScannedPage>>(emptyList())
-    val pages = _pages.asStateFlow()
+    val pages: StateFlow<List<ScannedPage>> = store.pages
 
+    // ----- Session meta -----
     private val _captureInProgress = MutableStateFlow(false)
     val captureInProgress = _captureInProgress.asStateFlow()
 
@@ -58,7 +63,7 @@ class ScanViewModel(
         val hash: Long,
         val time: Long,
         val centroidN: Pair<Float, Float>,
-        val areaN: Float
+        val areaN: Float,
     )
     private var lastSig: CaptureSig? = null
 
@@ -77,22 +82,21 @@ class ScanViewModel(
     private var latestCropped: Bitmap? = null
     private var latestCroppedAt: Long = 0L
 
-    // Параметры
-    private val captureCooldownMs = 900L  //1400
-    private val minFreezeMs = 1400L             // было 1600
+    // Params
+    private val captureCooldownMs = 900L
+    private val minFreezeMs = 1400L
     private val requireDocAbsenceFrames = 5
 
-    private val moveEpsNormalized = 0.02f       // было 0.008f
-    private val angleMin = 0.60                 // было 0.70
-    private val aspectMin = 0.35                // было 0.45
-    private val areaMinNorm = 0.08f             // было 0.10f
+    private val moveEpsNormalized = 0.02f
+    private val angleMin = 0.60
+    private val aspectMin = 0.35
+    private val areaMinNorm = 0.08f
 
-    private val lockFramesRequired = 8         // было 18, 10
+    private val lockFramesRequired = 8
     private val lockDecay = 0.18f
 
-    private val confirmDurationMs = 380L        // было 650, 450
-    // 🔑 Увеличено окно «свежести» кропа, чтобы успевать на медленных девайсах
-    private val acceptStalenessMs = 2200L       // было 1600/900 ранее
+    private val confirmDurationMs = 380L
+    private val acceptStalenessMs = 2200L
 
     private val dupTimeWindowMs = 2000L
     private val dupHashHammingThresh = 5
@@ -159,11 +163,12 @@ class ScanViewModel(
         if (_lockProgress.value >= 1f && _confirmAt.value == 0L) {
             _confirmAt.value = System.currentTimeMillis()
             viewModelScope.launch {
-                kotlinx.coroutines.delay(confirmDurationMs)
+                delay(confirmDurationMs)
                 val stillValid = _lockProgress.value >= 0.8f && !_captureFreeze.value
                 val recentCropped = (System.currentTimeMillis() - latestCroppedAt) <= acceptStalenessMs
-                if (stillValid && recentCropped && latestCropped != null) {
-                    performCapture(latestCropped!!, prevPoly ?: emptyList())
+                val bmp = latestCropped
+                if (stillValid && recentCropped && bmp != null) {
+                    performCapture(bmp, prevPoly ?: emptyList())
                 }
                 _confirmAt.value = 0L
                 _lockProgress.value = 0f
@@ -188,7 +193,7 @@ class ScanViewModel(
                 }
                 _wavePolygon.value = polygonForWave
                 _lastCapturedAt.value = now
-                _pages.value = _pages.value + page
+                store.add(page) // <— добавляем в общее хранилище
                 enableFreeze(CaptureSig(newHash, now, metrics.centroidN, metrics.areaN))
             }
             _captureInProgress.value = false
@@ -233,22 +238,15 @@ class ScanViewModel(
     }
 
     fun removeLastPage() {
-        val list = _pages.value
-        if (list.isEmpty()) return
-        val last = list.last()
-        viewModelScope.launch(Dispatchers.IO) {
-            repo.deletePage(last)
-            withContext(Dispatchers.Main) {
-                _pages.value = list.dropLast(1)
-            }
-        }
+        val removed = store.removeLast() ?: return
+        viewModelScope.launch(Dispatchers.IO) { repo.deletePage(removed) }
     }
 
     fun clearSession() {
         viewModelScope.launch(Dispatchers.IO) {
             repo.clearSession()
             withContext(Dispatchers.Main) {
-                _pages.value = emptyList()
+                store.clear()
                 _liveThumbnail.value = null
                 _wavePolygon.value = emptyList()
                 _lastCapturedAt.value = 0L
@@ -262,46 +260,6 @@ class ScanViewModel(
                 lastSig = null
             }
         }
-    }
-
-    // ----- STACK ACTIONS -----
-
-    fun movePage(from: Int, to: Int) {
-        if (from == to) return
-        val list = _pages.value.toMutableList()
-        if (from !in list.indices || to !in list.indices) return
-        val it = list.removeAt(from)
-        list.add(to, it)
-        _pages.value = list
-    }
-
-    fun deletePageAt(index: Int) {
-        val list = _pages.value
-        if (index !in list.indices) return
-        val page = list[index]
-        viewModelScope.launch(Dispatchers.IO) {
-            repo.deletePage(page)
-            withContext(Dispatchers.Main) {
-                _pages.value = list.toMutableList().apply { removeAt(index) }
-            }
-        }
-    }
-
-    fun rotatePage(index: Int, degrees: Int) {
-        val list = _pages.value
-        if (index !in list.indices) return
-        val page = list[index]
-        viewModelScope.launch(Dispatchers.IO) {
-            val updated = repo.rotatePage(page, degrees)
-            withContext(Dispatchers.Main) {
-                _pages.value = list.toMutableList().apply { set(index, updated) }
-            }
-        }
-    }
-
-    suspend fun buildPdf(options: PdfOptions): File {
-        val current = pages.value // snapshot
-        return repo.buildPdf(current, options)
     }
 
     // ----- Utils for duplicate -----
@@ -336,7 +294,7 @@ class ScanViewModel(
             val (x2, y2) = poly[(i + 1) % poly.size]
             s += (x1 * y2 - x2 * y1)
         }
-        return kotlin.math.abs(s) * 0.5f
+        return abs(s) * 0.5f
     }
 
     private fun polygonCentroid(poly: List<Pair<Float, Float>>): Pair<Float, Float> {
@@ -350,7 +308,7 @@ class ScanViewModel(
             a += cross
         }
         val area = a * 0.5f
-        if (kotlin.math.abs(area) < 1e-6f) return 0f to 0f
+        if (abs(area) < 1e-6f) return 0f to 0f
         val k = 1f / (6f * area)
         return (cx * k) to (cy * k)
     }
@@ -358,7 +316,7 @@ class ScanViewModel(
     private fun distance(a: Pair<Float, Float>, b: Pair<Float, Float>): Float {
         val dx = a.first - b.first
         val dy = a.second - b.second
-        return kotlin.math.sqrt(dx * dx + dy * dy)
+        return sqrt(dx * dx + dy * dy)
     }
 
     private fun rightAngleScore(poly: List<Pair<Float, Float>>): Double {
@@ -368,12 +326,12 @@ class ScanViewModel(
             val cbx = cx - bx
             val cby = cy - by
             val dot = abx * cbx + aby * cby
-            val norm = sqrt((abx * abx + aby * aby).toDouble() * (cbx * cbx + cby * cby).toDouble())
-            val cos = (dot / max(1e-6, norm)).coerceIn(-1.0, 1.0)
+            val norm = sqrt((abx * abx + aby * aby).toDouble() * (cbx * cbx + cby * cby).toDouble()).coerceAtLeast(1e-6)
+            val cos = (dot / norm).coerceIn(-1.0, 1.0)
             return Math.toDegrees(acos(cos))
         }
+        if (poly.size < 4) return 0.0
         val p = poly
-        if (p.size < 4) return 0.0
         val angs = listOf(
             angle(p[3].first, p[3].second, p[0].first, p[0].second, p[1].first, p[1].second),
             angle(p[0].first, p[0].second, p[1].first, p[1].second, p[2].first, p[2].second),
@@ -385,19 +343,23 @@ class ScanViewModel(
     }
 
     private fun aspectA4Score(poly: List<Pair<Float, Float>>): Double {
+        if (poly.size < 4) return 0.0
         val xs = poly.map { it.first }
-        the@ run {}
         val ys = poly.map { it.second }
-        val w = (xs.max() - xs.min()).coerceAtLeast(1f)
-        val h = (ys.max() - ys.min()).coerceAtLeast(1f)
+        val maxX = xs.maxOrNull() ?: return 0.0
+        val minX = xs.minOrNull() ?: return 0.0
+        val maxY = ys.maxOrNull() ?: return 0.0
+        val minY = ys.minOrNull() ?: return 0.0
+        val w = (maxX - minX).coerceAtLeast(1f)
+        val h = (maxY - minY).coerceAtLeast(1f)
         val r = if (w > h) w / h else h / w
         val target = 1.4142f
-        val diff = kotlin.math.abs(r - target)
+        val diff = abs(r - target)
         return (1.0 - (diff / 0.8f)).coerceIn(0.0, 1.0)
     }
 
     private fun averageHash64(bmp: Bitmap): Long {
-        val small = Bitmap.createScaledBitmap(bmp, 8, 8, true)
+        val small = bmp.scale(8, 8)
         val pixels = IntArray(64)
         small.getPixels(pixels, 0, 8, 0, 0, 8, 8)
         var sum = 0
@@ -413,11 +375,10 @@ class ScanViewModel(
         }
         val avg = sum / 64
         var hash = 0L
-        for (i in 0 until 64) {
-            if (gray[i] >= avg) hash = hash or (1L shl i)
-        }
+        for (i in 0 until 64) if (gray[i] >= avg) hash = hash or (1L shl i)
         small.recycle()
         return hash
     }
+
     private fun hammingDistance(a: Long, b: Long): Int = java.lang.Long.bitCount(a xor b)
 }

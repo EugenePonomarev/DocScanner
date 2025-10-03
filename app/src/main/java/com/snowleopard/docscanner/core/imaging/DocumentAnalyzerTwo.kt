@@ -1,4 +1,4 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.core.imaging
 
 import android.graphics.Bitmap
 import android.graphics.ImageFormat
@@ -24,12 +24,12 @@ class DocumentAnalyzerTwo(
     private val onResult: (polygon: List<Pair<Float, Float>>, cropped: Bitmap?, thumbnail: Bitmap?) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
-    // --- Тайминг анализа ---
+    // --- Timing / throttling ---
     private val minAnalyzeIntervalMs = 40L
     private var lastAnalyzeAt = 0L
     private var frameIndex = 0
 
-    // --- Стабилизация/порог ---
+    // --- Stabilization / thresholds ---
     private var prevQuad: Array<Point>? = null
     private var prevScore: Double = 0.0
     private var stableFrames: Int = 0
@@ -41,12 +41,12 @@ class DocumentAnalyzerTwo(
     private val fastLockScore = 0.65
     private val movementEpsNormalized = 0.010
 
-    // --- ROI-ускорение ---
+    // --- ROI speed-ups ---
     private val maxWDetectFull = 480
     private val roiPadFrac = 0.16
     private val maxWDetectRoiMin = 300
 
-    // --- Pass-план ---
+    // --- Pass plan ---
     private val heavyEvery = 8
     private var missCounter = 0
 
@@ -54,11 +54,10 @@ class DocumentAnalyzerTwo(
     private val houghAngleTol = 15.0
     private val houghMinLineLenRatio = 0.40
 
-    // Постпроцесс
     private enum class EnhanceProfile { NONE, SOFT, BW }
     private val enhanceProfile = EnhanceProfile.NONE
 
-    // --- Профайлинг ---
+    // --- Profiling ---
     private data class T(var ms: Long = 0)
     private data class Times(
         val tResize: T = T(),
@@ -81,20 +80,21 @@ class DocumentAnalyzerTwo(
         try {
             val t0 = System.nanoTime()
 
-            // 1) Серый канал (Y)
-            val graySrc = yPlaneToGrayMat(image) ?: run {
+            // 1) Extract Y-plane as gray Mat (fast path)
+            val graySrc = yPlaneToGrayMat(image)
+            if (graySrc == null) {
                 onDebug(null, "no gray")
                 onResult(emptyList(), null, null)
-                image.close(); return
+                image.close()
+                return
             }
 
-            // 2) Поворот под дисплей
+            // 2) Rotate to display orientation
             val rotation = image.imageInfo.rotationDegrees
-            val gray = rotateMat(graySrc, rotation) // полный размер
-            graySrc.release()
+            val gray = rotateMat(graySrc, rotation) // graySrc released inside if rotated
             onFrameSize(gray.cols(), gray.rows())
 
-            // 3) Детекция/кроп (цвет тянем ТОЛЬКО при фиксации)
+            // 3) Detect/crop (color only on lock to save CPU)
             val out = detectAndCropFromGray(
                 grayFull = gray,
                 colorSupplier = {
@@ -142,17 +142,21 @@ class DocumentAnalyzerTwo(
         val srcH = grayFull.rows()
         val tR0 = System.nanoTime()
 
-        // --- 1) downscale (глобальный) ---
+        // 1) Global downscale
         val scaleFull = if (srcW > maxWDetectFull) maxWDetectFull.toDouble() / srcW else 1.0
         val dwFull = (srcW * scaleFull).roundToInt()
         val dhFull = (srcH * scaleFull).roundToInt()
         val grayDownFull = Mat()
-        Imgproc.resize(grayFull, grayDownFull, Size(dwFull.toDouble(), dhFull.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.resize(
+            grayFull, grayDownFull,
+            Size(dwFull.toDouble(), dhFull.toDouble()),
+            0.0, 0.0, Imgproc.INTER_AREA
+        )
         times.tResize.ms = ((System.nanoTime() - tR0) / 1_000_000).coerceAtLeast(0)
 
-        // --- 2) ROI вокруг prevQuad ---
+        // 2) ROI around previous quad
         val useRoi = prevQuad != null
-        val roiRectDown: org.opencv.core.Rect? = if (useRoi) {
+        val roiRectDown: Rect? = if (useRoi) {
             val q = prevQuad!!.map { p -> Point(p.x * scaleFull, p.y * scaleFull) }
             val minX = q.minOf { it.x }; val maxX = q.maxOf { it.x }
             val minY = q.minOf { it.y }; val maxY = q.maxOf { it.y }
@@ -163,7 +167,7 @@ class DocumentAnalyzerTwo(
             val y1 = ceil((maxY + pad).coerceAtMost(dhFull - 1.0)).toInt()
             val w = (x1 - x0).coerceAtLeast(32)
             val h = (y1 - y0).coerceAtLeast(32)
-            org.opencv.core.Rect(x0, y0, w, h)
+            Rect(x0, y0, w, h)
         } else null
 
         val grayWork: Mat
@@ -172,16 +176,20 @@ class DocumentAnalyzerTwo(
         val roiOffsetX: Int
         val roiOffsetY: Int
         val scaleRoi: Double
+        var grayRoi: Mat? = null
+        var tmpResize: Mat? = null
 
         if (roiRectDown != null) {
-            val grayRoi = grayDownFull.submat(roiRectDown)
+            grayRoi = grayDownFull.submat(roiRectDown)
             val needScale = roiRectDown.width > maxWDetectRoiMin
             scaleRoi = if (needScale) maxWDetectRoiMin.toDouble() / roiRectDown.width else 1.0
             if (scaleRoi < 1.0) {
-                val tmp = Mat()
-                Imgproc.resize(grayRoi, tmp, Size((roiRectDown.width * scaleRoi), (roiRectDown.height * scaleRoi)))
-                grayRoi.release()
-                grayWork = tmp
+                tmpResize = Mat()
+                Imgproc.resize(
+                    grayRoi, tmpResize,
+                    Size(roiRectDown.width * scaleRoi, roiRectDown.height * scaleRoi)
+                )
+                grayWork = tmpResize
             } else {
                 grayWork = grayRoi
             }
@@ -198,11 +206,11 @@ class DocumentAnalyzerTwo(
         fun workToDownFull(p: Point): Point =
             Point(p.x / scaleRoi + roiOffsetX, p.y / scaleRoi + roiOffsetY)
 
-        // --- 3) Cheap/Heavy препроцесс ---
+        // 3) Preprocess (light/heavy)
         val doHeavy = (frameIndex % heavyEvery == 0) || missCounter >= 3 || !useRoi
         val tP0 = System.nanoTime()
         if (doHeavy) {
-            val clahe = Imgproc.createCLAHE(1.1, Size(8.0, 8.0)) // чуть мягче
+            val clahe = Imgproc.createCLAHE(1.1, Size(8.0, 8.0))
             clahe.apply(grayWork, grayWork)
         }
         Imgproc.GaussianBlur(grayWork, grayWork, Size(3.0, 3.0), 0.0)
@@ -221,16 +229,16 @@ class DocumentAnalyzerTwo(
             val upper = (meanVal * 1.33).coerceIn(0.0, 255.0)
             Imgproc.Canny(grayWork, edgesThin, lower, upper)
         }
-
         val comb = edgesThin.clone()
         val k3 = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(comb, comb, Imgproc.MORPH_CLOSE, k3, Point(-1.0, -1.0), 1)
         times.tEdges.ms = ((System.nanoTime() - tE0) / 1_000_000).coerceAtLeast(0)
 
-        // --- 4) Контуры (в WORK-координатах) ---
+        // 4) Contours in WORK coordinates
         val tC0 = System.nanoTime()
         val contours = ArrayList<MatOfPoint>()
-        Imgproc.findContours(comb, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        val hierarchy = Mat()
+        Imgproc.findContours(comb, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
         val frameAreaWork = (dwWork * dhWork).toDouble()
         val areaMin = frameAreaWork * 0.08
@@ -256,12 +264,12 @@ class DocumentAnalyzerTwo(
                 3 -> reconstruct4thFromTriangle(approx.toArray())
                 else -> minAreaRectToQuad(c)
             }
+            approx.release()
+
             if (!Imgproc.isContourConvex(MatOfPoint(*quad))) continue
 
             val orderedWork = orderQuad(quad).toTypedArray()
-
-            // borderDistance считаем в КООРДИНАТАХ downFull:
-            val orderedFull = Array(4) { i -> workToDownFull(orderedWork[i]) }
+            val orderedFull = Array(4) { i -> workToDownFull(orderedWork[i]) } // to downFull for border score
 
             val breakdownFast = scoreQuadFast(orderedWork, orderedFull, area, frameAreaWork, dwFull, dhFull)
             var score = combinedScoreFast(breakdownFast)
@@ -281,7 +289,7 @@ class DocumentAnalyzerTwo(
         }
         times.tCnt.ms = ((System.nanoTime() - tC0) / 1_000_000).coerceAtLeast(0)
 
-        // --- 5) Hough — только при необходимости и редко ---
+        // 5) Hough fallback rarely
         val tH0 = System.nanoTime()
         if (bestQuadWork == null && doHeavy) {
             val houghQuad = findRectByHough(comb, dwWork, dhWork)
@@ -303,24 +311,31 @@ class DocumentAnalyzerTwo(
         }
         times.tHough.ms = ((System.nanoTime() - tH0) / 1_000_000).coerceAtLeast(0)
 
-        // --- 6) Координаты → downFull → src ---
+        // 6) Map back to src
         if (bestQuadWork == null) {
             missCounter++
             val dbg = matToBitmap(comb)
-            releaseMats(grayDownFull, grayWork, edgesThin, comb, k3)
+            // release mats safely
+            if (grayWork !== grayDownFull) grayWork.release()
+            tmpResize?.release()
+            grayRoi?.release()
+            releaseAll(contours)
+            hierarchy.release()
+            edgesThin.release()
+            comb.release()
+            k3.release()
+            grayDownFull.release()
+
             return DetectOut(emptyList(), null, dbg, "no quad ($srcTag) miss=$missCounter")
         } else {
             missCounter = 0
         }
 
         val bestQuadDownFull = bestQuadWork.map(::workToDownFull).toTypedArray()
-
-        val toSrc: (Point) -> Point = { p ->
-            if (scaleFull < 1.0) Point(p.x / scaleFull, p.y / scaleFull) else Point(p.x, p.y)
-        }
+        val toSrc: (Point) -> Point = { p -> if (scaleFull < 1.0) Point(p.x / scaleFull, p.y / scaleFull) else Point(p.x, p.y) }
         val currentQuad = bestQuadDownFull.map(toSrc).toTypedArray()
 
-        // --- 7) стабилизация/решение ---
+        // 7) Stabilization / decision
         val usePrevKeep = prevQuad != null && (bestScore + keepPrevIfBetterDelta) < prevScore
         val smoothed = if (prevQuad != null && !usePrevKeep) {
             Array(4) { i -> lerp(prevQuad!![i], currentQuad[i], alpha) }
@@ -334,7 +349,6 @@ class DocumentAnalyzerTwo(
         prevScore = if (usePrevKeep) prevScore else max(prevScore * (1 - alpha), bestScore)
 
         val needStable = if (bestScore >= fastLockScore && moveNorm < movementEpsNormalized * 0.7) 1 else minStableFramesToCrop
-
         stableFrames = if (bestScore >= minScoreToAccept && moveNorm < movementEpsNormalized) {
             (stableFrames + 1).coerceAtMost(8)
         } else 0
@@ -347,14 +361,12 @@ class DocumentAnalyzerTwo(
 
         var cropped: Bitmap? = null
         if (shouldCrop) {
-            // Цвет пробуем, если нет — делаем warp по серому full-кадру (фоллбек)
             val color = colorSupplier()
             cropped = if (color != null) {
                 warpByQuadBitmap(color, smoothed)
             } else {
                 warpByQuadGray(grayFull, smoothed)
-            }
-            if (cropped != null) cropped = applyPostproc(cropped, enhanceProfile)
+            }?.let { applyPostproc(it, enhanceProfile) }
         }
 
         val dbgBmp = matToBitmap(comb)
@@ -363,11 +375,21 @@ class DocumentAnalyzerTwo(
             bestBrk.size, bestBrk.border, bestBrk.edge, moveNorm, stableFrames, needStable, acceptForCrop
         )
 
-        releaseMats(grayDownFull, grayWork, edgesThin, comb, k3)
+        // release mats safely
+        if (grayWork !== grayDownFull) grayWork.release()
+        tmpResize?.release()
+        grayRoi?.release()
+        releaseAll(contours)
+        hierarchy.release()
+        edgesThin.release()
+        comb.release()
+        k3.release()
+        grayDownFull.release()
+
         return DetectOut(smoothed.toList(), cropped, dbgBmp, status)
     }
 
-    // ---------- СКОРИНГ / УТИЛИТЫ ----------
+    // ---------- Scoring / utils ----------
     private data class ScoreBreakdown(
         val rectangularity: Double = 0.0,
         val rightAngles: Double = 0.0,
@@ -482,7 +504,7 @@ class DocumentAnalyzerTwo(
         val br = intersect(lBottom, lRight) ?: return null
         val bl = intersect(lBottom, lLeft) ?: return null
 
-        val inBounds = fun(p: Point) = p.x >= -w * 0.2 && p.x <= w * 1.2 && p.y >= -h * 0.2 && p.y <= h * 1.2
+        fun inBounds(p: Point) = p.x >= -w * 0.2 && p.x <= w * 1.2 && p.y >= -h * 0.2 && p.y <= h * 1.2
         if (!inBounds(tl) || !inBounds(tr) || !inBounds(br) || !inBounds(bl)) return null
 
         val quad = orderQuad(arrayOf(tl, tr, br, bl)).toTypedArray()
@@ -516,7 +538,7 @@ class DocumentAnalyzerTwo(
         return Point(x, y)
     }
 
-    // ---------- Геометрия / Утилиты ----------
+    // ---------- Geometry / helpers ----------
 
     private fun minAreaRectToQuad(c: MatOfPoint): Array<Point> {
         val mr = Imgproc.minAreaRect(MatOfPoint2f(*c.toArray()))
@@ -551,11 +573,11 @@ class DocumentAnalyzerTwo(
     }
 
     private fun orderQuad(pts: Array<Point>): List<Point> {
-        val tl = pts.minBy { it.x + it.y }
-        val br = pts.maxBy { it.x + it.y }
+        val tl = pts.minByOrNull { it.x + it.y } ?: pts.first()
+        val br = pts.maxByOrNull { it.x + it.y } ?: pts.last()
         val sortedDiff = pts.sortedBy { it.x - it.y }
-        val bl = sortedDiff.first()
-        val tr = sortedDiff.last()
+        val bl = sortedDiff.firstOrNull() ?: tl
+        val tr = sortedDiff.lastOrNull() ?: br
         return listOf(tl, tr, br, bl)
     }
 
@@ -566,8 +588,8 @@ class DocumentAnalyzerTwo(
             val abx = a.x - b.x; val aby = a.y - b.y
             val cbx = c.x - b.x; val cby = c.y - b.y
             val dot = abx * cbx + aby * cby
-            val norm = sqrt((abx * abx + aby * aby) * (cbx * cbx + cby * cby))
-            val cos = (dot / max(1e-6, norm)).coerceIn(-1.0, 1.0)
+            val norm = sqrt((abx * abx + aby * aby) * (cbx * cbx + cby * cby)).coerceAtLeast(1e-6)
+            val cos = (dot / norm).coerceIn(-1.0, 1.0)
             return Math.toDegrees(acos(cos))
         }
         val pts = orderQuad(quad)
@@ -584,7 +606,7 @@ class DocumentAnalyzerTwo(
     private fun normalizeAspect(ratio: Double): Double {
         val r = if (ratio < 1.0) 1.0 / ratio else ratio
         val targets = doubleArrayOf(1.414213562, 1.294117647) // A4, Letter
-        val diff = targets.minOf { kotlin.math.abs(r - it) }
+        val diff = targets.minOf { abs(r - it) }
         return (1.0 - (diff / 0.6)).coerceIn(0.0, 1.0)
     }
 
@@ -643,7 +665,6 @@ class DocumentAnalyzerTwo(
         return out
     }
 
-    // Фоллбек: warp из серого Mat (full-res)
     private fun warpByQuadGray(srcGray: Mat, quad: Array<Point>): Bitmap? {
         val widthTop = dist(quad[0], quad[1])
         val widthBottom = dist(quad[3], quad[2])
@@ -693,7 +714,7 @@ class DocumentAnalyzerTwo(
         return b.scale(width, h)
     }
 
-    // ---------- Постпроцесс ----------
+    // ---------- Post-process ----------
     private fun applyPostproc(bmp: Bitmap, profile: EnhanceProfile): Bitmap = when (profile) {
         EnhanceProfile.NONE -> bmp
         EnhanceProfile.SOFT -> enhanceSoft(bmp)
@@ -707,19 +728,16 @@ class DocumentAnalyzerTwo(
         val channels = ArrayList<Mat>(3)
         Core.split(ycrcb, channels)
 
-        // слабее CLAHE
         val clahe = Imgproc.createCLAHE(0.8, Size(64.0, 64.0))
         clahe.apply(channels[0], channels[0])
 
         Core.merge(channels, ycrcb)
         Imgproc.cvtColor(ycrcb, rgba, Imgproc.COLOR_YCrCb2RGB)
 
-        // минимум шейпинга
         val blur = Mat()
         Imgproc.GaussianBlur(rgba, blur, Size(0.0, 0.0), 0.6)
         Core.addWeighted(rgba, 1.01, blur, -0.01, 0.0, rgba)
 
-        // капля контраста
         rgba.convertTo(rgba, -1, 1.005, -0.5)
 
         val out = createBitmap(bmp.width, bmp.height)
@@ -747,7 +765,7 @@ class DocumentAnalyzerTwo(
         return out
     }
 
-    // ---------- Работа с ImageProxy ----------
+    // ---------- ImageProxy helpers ----------
     @OptIn(ExperimentalGetImage::class)
     private fun yPlaneToGrayMat(image: ImageProxy): Mat? {
         val img = image.image ?: return null
@@ -848,5 +866,8 @@ class DocumentAnalyzerTwo(
         return out
     }
 
-    private fun releaseMats(vararg mats: Mat) { mats.forEach { runCatching { it.release() } } }
+    // --- release helpers ---
+    private fun releaseAll(contours: List<MatOfPoint>) {
+        contours.forEach { c -> runCatching { c.release() }.onFailure { } }
+    }
 }

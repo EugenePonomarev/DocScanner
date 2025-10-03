@@ -1,4 +1,4 @@
-package com.snowleopard.docscanner
+package com.snowleopard.docscanner.core.imaging
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
