@@ -25,7 +25,7 @@ class DocumentAnalyzerTwo(
 ) : ImageAnalysis.Analyzer {
 
     // --- Тайминг анализа ---
-    private val minAnalyzeIntervalMs = 60L
+    private val minAnalyzeIntervalMs = 40L
     private var lastAnalyzeAt = 0L
     private var frameIndex = 0
 
@@ -42,21 +42,21 @@ class DocumentAnalyzerTwo(
     private val movementEpsNormalized = 0.010
 
     // --- ROI-ускорение ---
-    private val maxWDetectFull = 520                    // глобальный поиск
-    private val roiPadFrac = 0.18                       // запас вокруг предыдущего квада
-    private val maxWDetectRoiMin = 320                  // минимальная ширина детекции для ROI
+    private val maxWDetectFull = 480
+    private val roiPadFrac = 0.16
+    private val maxWDetectRoiMin = 300
 
     // --- Pass-план ---
-    private val heavyEvery = 5                          // heavy-pass реже
-    private var missCounter = 0                         // если подряд нет кандидата — форсим heavy-pass
+    private val heavyEvery = 8
+    private var missCounter = 0
 
     // --- Hough ---
     private val houghAngleTol = 15.0
     private val houghMinLineLenRatio = 0.40
 
-    // Постпроцесс (только при фиксации)
+    // Постпроцесс
     private enum class EnhanceProfile { NONE, SOFT, BW }
-    private val enhanceProfile = EnhanceProfile.SOFT
+    private val enhanceProfile = EnhanceProfile.NONE
 
     // --- Профайлинг ---
     private data class T(var ms: Long = 0)
@@ -84,18 +84,19 @@ class DocumentAnalyzerTwo(
             // 1) Серый канал (Y)
             val graySrc = yPlaneToGrayMat(image) ?: run {
                 onDebug(null, "no gray")
+                onResult(emptyList(), null, null)
                 image.close(); return
             }
 
             // 2) Поворот под дисплей
             val rotation = image.imageInfo.rotationDegrees
-            val gray = rotateMat(graySrc, rotation)
+            val gray = rotateMat(graySrc, rotation) // полный размер
             graySrc.release()
             onFrameSize(gray.cols(), gray.rows())
 
             // 3) Детекция/кроп (цвет тянем ТОЛЬКО при фиксации)
             val out = detectAndCropFromGray(
-                gray = gray,
+                grayFull = gray,
                 colorSupplier = {
                     val color = imageProxyToColorBitmap(image) ?: return@detectAndCropFromGray null
                     if (rotation != 0) {
@@ -134,20 +135,19 @@ class DocumentAnalyzerTwo(
     )
 
     private fun detectAndCropFromGray(
-        gray: Mat,
+        grayFull: Mat,
         colorSupplier: () -> Bitmap?,
     ): DetectOut {
-        val srcW = gray.cols()
-        val srcH = gray.rows()
-        val diagSrc = hypot(srcW.toDouble(), srcH.toDouble())
-
+        val srcW = grayFull.cols()
+        val srcH = grayFull.rows()
         val tR0 = System.nanoTime()
+
         // --- 1) downscale (глобальный) ---
         val scaleFull = if (srcW > maxWDetectFull) maxWDetectFull.toDouble() / srcW else 1.0
         val dwFull = (srcW * scaleFull).roundToInt()
         val dhFull = (srcH * scaleFull).roundToInt()
         val grayDownFull = Mat()
-        Imgproc.resize(gray, grayDownFull, Size(dwFull.toDouble(), dhFull.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.resize(grayFull, grayDownFull, Size(dwFull.toDouble(), dhFull.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
         times.tResize.ms = ((System.nanoTime() - tR0) / 1_000_000).coerceAtLeast(0)
 
         // --- 2) ROI вокруг prevQuad ---
@@ -202,48 +202,27 @@ class DocumentAnalyzerTwo(
         val doHeavy = (frameIndex % heavyEvery == 0) || missCounter >= 3 || !useRoi
         val tP0 = System.nanoTime()
         if (doHeavy) {
-            // Heavy: немного CLAHE для стабильности
-            val clahe = Imgproc.createCLAHE(1.2, Size(8.0, 8.0))
+            val clahe = Imgproc.createCLAHE(1.1, Size(8.0, 8.0)) // чуть мягче
             clahe.apply(grayWork, grayWork)
         }
-        // Общий blur
-        Imgproc.GaussianBlur(grayWork, grayWork, Size(5.0, 5.0), 0.0)
+        Imgproc.GaussianBlur(grayWork, grayWork, Size(3.0, 3.0), 0.0)
         times.tPrep.ms = ((System.nanoTime() - tP0) / 1_000_000).coerceAtLeast(0)
 
         val tE0 = System.nanoTime()
-        // Edges
         val edgesThin = Mat()
         if (doHeavy) {
-            // Автопорог по медиане дороже — используем только в heavy
             val med = median(grayWork)
             val lower = max(0.0, 0.66 * med)
             val upper = min(255.0, 1.33 * med)
             Imgproc.Canny(grayWork, edgesThin, lower, upper)
         } else {
-            // Дёшево: пороги от среднего
             val meanVal = Core.mean(grayWork).`val`[0].coerceIn(1.0, 254.0)
             val lower = (meanVal * 0.66).coerceIn(0.0, 255.0)
             val upper = (meanVal * 1.33).coerceIn(0.0, 255.0)
             Imgproc.Canny(grayWork, edgesThin, lower, upper)
         }
 
-        // Дополнительно бинар в heavy (даёт массу)
-        val comb = if (doHeavy) {
-            val bin = Mat()
-            Imgproc.adaptiveThreshold(
-                grayWork, bin, 255.0,
-                Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C,
-                Imgproc.THRESH_BINARY, 19, 4.0
-            )
-            Core.bitwise_not(bin, bin)
-            val tmp = Mat()
-            Core.bitwise_or(bin, edgesThin, tmp)
-            bin.release()
-            tmp
-        } else {
-            edgesThin.clone()
-        }
-
+        val comb = edgesThin.clone()
         val k3 = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.morphologyEx(comb, comb, Imgproc.MORPH_CLOSE, k3, Point(-1.0, -1.0), 1)
         times.tEdges.ms = ((System.nanoTime() - tE0) / 1_000_000).coerceAtLeast(0)
@@ -254,10 +233,10 @@ class DocumentAnalyzerTwo(
         Imgproc.findContours(comb, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
         val frameAreaWork = (dwWork * dhWork).toDouble()
-        val areaMin = frameAreaWork * 0.08                      // чуть строже — меньше соринок
+        val areaMin = frameAreaWork * 0.08
         val perimMin = (dwWork + dhWork) * 0.55
 
-        val sorted = contours.sortedByDescending { Imgproc.contourArea(it) }.take(8)
+        val sorted = contours.sortedByDescending { Imgproc.contourArea(it) }.take(5)
 
         var bestQuadWork: Array<Point>? = null
         var bestScore = -1.0
@@ -281,20 +260,17 @@ class DocumentAnalyzerTwo(
 
             val orderedWork = orderQuad(quad).toTypedArray()
 
-            // ⚠️ ВАЖНО: borderDistance считаем в КООРДИНАТАХ downFull!
+            // borderDistance считаем в КООРДИНАТАХ downFull:
             val orderedFull = Array(4) { i -> workToDownFull(orderedWork[i]) }
 
-            // Быстрый «гео»-скользящий скор (без edgeSupport, чтобы экономить)
             val breakdownFast = scoreQuadFast(orderedWork, orderedFull, area, frameAreaWork, dwFull, dhFull)
             var score = combinedScoreFast(breakdownFast)
 
-            // Только если быстрый скор перспективный — считаем edgeSupport (дороже)
             val breakdown = if (score >= 0.25) {
-                val edgeScore = edgeSupportScore(orderedWork, comb) // comb в WORK-координатах
+                val edgeScore = edgeSupportScore(orderedWork, comb)
                 breakdownFast.copy(edge = edgeScore)
             } else breakdownFast
 
-            // Итоговый комбинированный скор
             score = combinedScore(breakdown)
 
             if (score > bestScore) {
@@ -308,7 +284,7 @@ class DocumentAnalyzerTwo(
         // --- 5) Hough — только при необходимости и редко ---
         val tH0 = System.nanoTime()
         if (bestQuadWork == null && doHeavy) {
-            val houghQuad = findRectByHough(edgesThin, dwWork, dhWork)
+            val houghQuad = findRectByHough(comb, dwWork, dhWork)
             if (houghQuad != null) {
                 val rectArea = polygonArea(orderedList(houghQuad))
                 val orderedFull = Array(4) { i -> workToDownFull(houghQuad[i]) }
@@ -332,7 +308,7 @@ class DocumentAnalyzerTwo(
             missCounter++
             val dbg = matToBitmap(comb)
             releaseMats(grayDownFull, grayWork, edgesThin, comb, k3)
-            return DetectOut(emptyList(), null, dbg, "no quad (${srcTag}) miss=$missCounter")
+            return DetectOut(emptyList(), null, dbg, "no quad ($srcTag) miss=$missCounter")
         } else {
             missCounter = 0
         }
@@ -357,7 +333,6 @@ class DocumentAnalyzerTwo(
         prevQuad = smoothed
         prevScore = if (usePrevKeep) prevScore else max(prevScore * (1 - alpha), bestScore)
 
-        // Fast-lock: если очень уверены и почти нет движения — не ждём много кадров
         val needStable = if (bestScore >= fastLockScore && moveNorm < movementEpsNormalized * 0.7) 1 else minStableFramesToCrop
 
         stableFrames = if (bestScore >= minScoreToAccept && moveNorm < movementEpsNormalized) {
@@ -372,11 +347,14 @@ class DocumentAnalyzerTwo(
 
         var cropped: Bitmap? = null
         if (shouldCrop) {
+            // Цвет пробуем, если нет — делаем warp по серому full-кадру (фоллбек)
             val color = colorSupplier()
-            if (color != null) {
-                cropped = warpByQuad(color, smoothed)
-                if (cropped != null) cropped = applyPostproc(cropped, enhanceProfile)
+            cropped = if (color != null) {
+                warpByQuadBitmap(color, smoothed)
+            } else {
+                warpByQuadGray(grayFull, smoothed)
             }
+            if (cropped != null) cropped = applyPostproc(cropped, enhanceProfile)
         }
 
         val dbgBmp = matToBitmap(comb)
@@ -390,7 +368,6 @@ class DocumentAnalyzerTwo(
     }
 
     // ---------- СКОРИНГ / УТИЛИТЫ ----------
-
     private data class ScoreBreakdown(
         val rectangularity: Double = 0.0,
         val rightAngles: Double = 0.0,
@@ -400,10 +377,9 @@ class DocumentAnalyzerTwo(
         val edge: Double = 0.0,
     )
 
-    // Быстрый скор без edge/bright/contrast
     private fun scoreQuadFast(
-        quadWork: Array<Point>,               // в WORK-координатах
-        quadDownFull: Array<Point>,           // тот же контур в downFull-координатах
+        quadWork: Array<Point>,
+        quadDownFull: Array<Point>,
         contourAreaWork: Double,
         frameAreaWork: Double,
         dwFull: Int,
@@ -414,8 +390,8 @@ class DocumentAnalyzerTwo(
         val rectangularity = (contourAreaWork / max(1.0, rect.width.toDouble() * rect.height)).coerceIn(0.0, 1.0)
         val angScore = rightAngleScore(quadWork)
         val aspectNorm = normalizeAspect(aspect)
-        val sizeNorm = (contourAreaWork / frameAreaWork).coerceIn(0.0, 1.0) // размер относительно ROI/WORK
-        val borderScore = borderDistanceScore(quadDownFull, dwFull, dhFull) // ⚠️ глобальные границы
+        val sizeNorm = (contourAreaWork / frameAreaWork).coerceIn(0.0, 1.0)
+        val borderScore = borderDistanceScore(quadDownFull, dwFull, dhFull)
         return ScoreBreakdown(rectangularity, angScore, aspectNorm, sizeNorm, borderScore, 0.0)
     }
 
@@ -638,7 +614,7 @@ class DocumentAnalyzerTwo(
     private fun lerp(a: Point, b: Point, t: Double): Point = Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 
     // ---------- Warp ----------
-    private fun warpByQuad(src: Bitmap, quad: Array<Point>): Bitmap? {
+    private fun warpByQuadBitmap(src: Bitmap, quad: Array<Point>): Bitmap? {
         val widthTop = dist(quad[0], quad[1])
         val widthBottom = dist(quad[3], quad[2])
         val heightLeft = dist(quad[0], quad[3])
@@ -650,7 +626,7 @@ class DocumentAnalyzerTwo(
         val srcMat = Mat().also { Utils.bitmapToMat(src, it) }
         val dst = Mat()
 
-        val srcPts = MatOfPoint2f(quad[0], quad[1], quad[2], quad[3]) // TL,TR,BR,BL
+        val srcPts = MatOfPoint2f(quad[0], quad[1], quad[2], quad[3])
         val dstPts = MatOfPoint2f(
             Point(0.0, 0.0),
             Point(width - 1.0, 0.0),
@@ -664,6 +640,37 @@ class DocumentAnalyzerTwo(
         Utils.matToBitmap(dst, out)
 
         srcMat.release(); dst.release(); srcPts.release(); dstPts.release(); m.release()
+        return out
+    }
+
+    // Фоллбек: warp из серого Mat (full-res)
+    private fun warpByQuadGray(srcGray: Mat, quad: Array<Point>): Bitmap? {
+        val widthTop = dist(quad[0], quad[1])
+        val widthBottom = dist(quad[3], quad[2])
+        val heightLeft = dist(quad[0], quad[3])
+        val heightRight = dist(quad[1], quad[2])
+
+        val width = max(widthTop, widthBottom).roundToInt().coerceAtLeast(300)
+        val height = max(heightLeft, heightRight).roundToInt().coerceAtLeast(300)
+
+        val dst = Mat()
+
+        val srcPts = MatOfPoint2f(quad[0], quad[1], quad[2], quad[3])
+        val dstPts = MatOfPoint2f(
+            Point(0.0, 0.0),
+            Point(width - 1.0, 0.0),
+            Point(width - 1.0, height - 1.0),
+            Point(0.0, height - 1.0)
+        )
+        val m = Imgproc.getPerspectiveTransform(srcPts, dstPts)
+        Imgproc.warpPerspective(srcGray, dst, m, Size(width.toDouble(), height.toDouble()))
+
+        val rgba = Mat()
+        Imgproc.cvtColor(dst, rgba, Imgproc.COLOR_GRAY2RGBA)
+        val out = createBitmap(width, height)
+        Utils.matToBitmap(rgba, out)
+
+        dst.release(); rgba.release(); srcPts.release(); dstPts.release(); m.release()
         return out
     }
 
@@ -699,20 +706,27 @@ class DocumentAnalyzerTwo(
         val ycrcb = Mat(); Imgproc.cvtColor(rgb, ycrcb, Imgproc.COLOR_RGB2YCrCb)
         val channels = ArrayList<Mat>(3)
         Core.split(ycrcb, channels)
-        val clahe = Imgproc.createCLAHE(1.0, Size(16.0, 16.0))
+
+        // слабее CLAHE
+        val clahe = Imgproc.createCLAHE(0.8, Size(64.0, 64.0))
         clahe.apply(channels[0], channels[0])
+
         Core.merge(channels, ycrcb)
-        Imgproc.cvtColor(ycrcb, rgb, Imgproc.COLOR_YCrCb2RGB)
-        Imgproc.cvtColor(rgb, rgba, Imgproc.COLOR_RGB2RGBA)
+        Imgproc.cvtColor(ycrcb, rgba, Imgproc.COLOR_YCrCb2RGB)
+
+        // минимум шейпинга
         val blur = Mat()
-        Imgproc.GaussianBlur(rgba, blur, Size(0.0, 0.0), 0.9)
-        Core.addWeighted(rgba, 1.03, blur, -0.03, 0.0, rgba)
-        blur.release()
-        rgba.convertTo(rgba, -1, 1.02, -2.0)
+        Imgproc.GaussianBlur(rgba, blur, Size(0.0, 0.0), 0.6)
+        Core.addWeighted(rgba, 1.01, blur, -0.01, 0.0, rgba)
+
+        // капля контраста
+        rgba.convertTo(rgba, -1, 1.005, -0.5)
+
         val out = createBitmap(bmp.width, bmp.height)
         Utils.matToBitmap(rgba, out)
+
         channels.forEach { it.release() }
-        ycrcb.release(); rgb.release(); rgba.release()
+        ycrcb.release(); rgb.release(); rgba.release(); blur.release()
         return out
     }
 

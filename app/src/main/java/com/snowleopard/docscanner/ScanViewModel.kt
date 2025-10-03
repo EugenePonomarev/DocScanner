@@ -1,6 +1,5 @@
 package com.snowleopard.docscanner
 
-import android.content.Context
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -49,7 +48,7 @@ class ScanViewModel(
     private val _wavePolygon = MutableStateFlow<List<Pair<Float, Float>>>(emptyList())
     val wavePolygon = _wavePolygon.asStateFlow()
 
-    // Freeze/duplicate FSM (сокр. — как в последней версии)
+    // Freeze/duplicate FSM
     private val _captureFreeze = MutableStateFlow(false)
     val captureFreeze = _captureFreeze.asStateFlow()
     private var frozenAt: Long = 0L
@@ -78,21 +77,22 @@ class ScanViewModel(
     private var latestCropped: Bitmap? = null
     private var latestCroppedAt: Long = 0L
 
-    // Параметры (как договорились — «плавнее»)
-    private val captureCooldownMs = 1400L
-    private val minFreezeMs = 1600L
+    // Параметры
+    private val captureCooldownMs = 900L  //1400
+    private val minFreezeMs = 1400L             // было 1600
     private val requireDocAbsenceFrames = 5
 
-    private val moveEpsNormalized = 0.008f
-    private val angleMin = 0.70
-    private val aspectMin = 0.45
-    private val areaMinNorm = 0.10f
+    private val moveEpsNormalized = 0.02f       // было 0.008f
+    private val angleMin = 0.60                 // было 0.70
+    private val aspectMin = 0.35                // было 0.45
+    private val areaMinNorm = 0.08f             // было 0.10f
 
-    private val lockFramesRequired = 18
+    private val lockFramesRequired = 8         // было 18, 10
     private val lockDecay = 0.18f
 
-    private val confirmDurationMs = 650L
-    private val acceptStalenessMs = 900L
+    private val confirmDurationMs = 380L        // было 650, 450
+    // 🔑 Увеличено окно «свежести» кропа, чтобы успевать на медленных девайсах
+    private val acceptStalenessMs = 2200L       // было 1600/900 ранее
 
     private val dupTimeWindowMs = 2000L
     private val dupHashHammingThresh = 5
@@ -386,12 +386,13 @@ class ScanViewModel(
 
     private fun aspectA4Score(poly: List<Pair<Float, Float>>): Double {
         val xs = poly.map { it.first }
+        the@ run {}
         val ys = poly.map { it.second }
         val w = (xs.max() - xs.min()).coerceAtLeast(1f)
         val h = (ys.max() - ys.min()).coerceAtLeast(1f)
         val r = if (w > h) w / h else h / w
         val target = 1.4142f
-        val diff = abs(r - target)
+        val diff = kotlin.math.abs(r - target)
         return (1.0 - (diff / 0.8f)).coerceIn(0.0, 1.0)
     }
 

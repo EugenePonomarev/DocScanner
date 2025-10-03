@@ -2,9 +2,12 @@ package com.snowleopard.docscanner
 
 import android.Manifest
 import android.graphics.BitmapFactory
+import android.util.Size
+import android.view.Surface
 import android.view.ViewGroup
-import androidx.activity.ComponentActivity
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -32,15 +35,16 @@ import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.asExecutor
+import kotlinx.coroutines.delay
 import org.koin.androidx.compose.koinViewModel
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.math.min
 
 @OptIn(ExperimentalPermissionsApi::class)
@@ -51,12 +55,12 @@ fun CameraScreen(
 ) {
     val cameraPermission = rememberPermissionState(Manifest.permission.CAMERA)
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val density = LocalDensity.current
 
     LaunchedEffect(Unit) {
         if (!cameraPermission.status.isGranted) cameraPermission.launchPermissionRequest()
     }
-
     if (!cameraPermission.status.isGranted) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("Требуется разрешение камеры")
@@ -64,6 +68,7 @@ fun CameraScreen(
         return
     }
 
+    // VM state
     val polygonRaw by viewModel.livePreviewPolygon.collectAsState()
     val frameSize by viewModel.frameSize.collectAsState()
     val thumb by viewModel.liveThumbnail.collectAsState()
@@ -79,16 +84,88 @@ fun CameraScreen(
     var viewW by remember { mutableStateOf(0) }
     var viewH by remember { mutableStateOf(0) }
 
-    // Флэш-баннер "Добавлено: N"
+    // PreviewView + executor
+    val previewView = remember {
+        PreviewView(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            scaleType = PreviewView.ScaleType.FIT_CENTER
+        }
+    }
+    val cameraExecutor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
+
+    // Bind once
+    DisposableEffect(lifecycleOwner) {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+        val cameraProvider = cameraProviderFuture.get()
+
+        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
+
+        val previewSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(
+                ResolutionStrategy(Size(1280, 960), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER)
+            )
+            .build()
+
+        val preview = Preview.Builder()
+            .setResolutionSelector(previewSelector)
+            .setTargetRotation(rotation)
+            .build().also { it.surfaceProvider = previewView.surfaceProvider }
+
+        val analysisSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            .build()
+
+        val analysis = ImageAnalysis.Builder()
+            .setResolutionSelector(analysisSelector)
+            .setTargetRotation(rotation)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setImageQueueDepth(2)
+            // 🔑 Гарантируем формат YUV 420, чтобы цветовая конвертация не падала:
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .build()
+
+        val analyzer = DocumentAnalyzerTwo(
+            onFrameSize = { w, h -> viewModel.setFrameSize(w, h) },
+            onDebug = { bmp, text ->
+                viewModel.setDebugFrame(bmp)
+                viewModel.setStatus(text)
+            },
+            onResult = { poly, cropped, thumbnail ->
+                viewModel.onAnalyzerResult(poly, cropped, thumbnail)
+            }
+        )
+        analysis.setAnalyzer(cameraExecutor, analyzer)
+
+        try {
+            cameraProvider.unbindAll()
+            cameraProvider.bindToLifecycle(
+                lifecycleOwner, cameraSelector, preview, analysis
+            )
+        } catch (_: Exception) {}
+
+        onDispose {
+            runCatching { cameraProvider.unbindAll() }
+            runCatching { cameraExecutor.shutdown() }
+        }
+    }
+
+    // ===== UI — твой, без потерь =====
+
     var showAdded by remember(lastCapturedAt) { mutableStateOf(lastCapturedAt != 0L) }
     LaunchedEffect(lastCapturedAt) {
         if (lastCapturedAt == 0L) return@LaunchedEffect
         showAdded = true
-        kotlinx.coroutines.delay(1200)
+        delay(1200)
         showAdded = false
     }
 
-    // Волна на контуре после фактического захвата
     val waveProgress = remember { Animatable(1f) }
     LaunchedEffect(lastCapturedAt) {
         if (lastCapturedAt == 0L || wavePolygon.isEmpty()) return@LaunchedEffect
@@ -96,7 +173,6 @@ fun CameraScreen(
         waveProgress.animateTo(1f, tween(420, easing = LinearEasing))
     }
 
-    // 🍏 Анимация "в центр → в угол" для мини-превью
     var animBmp by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     val animProgress = remember { Animatable(1f) }
     LaunchedEffect(lastCapturedAt, pages.size) {
@@ -110,7 +186,6 @@ fun CameraScreen(
         }
     }
 
-    // Confirm-анимация (скан-стропы) поверх полигона — играется, когда confirmAt > 0
     val confirmProgress = remember { Animatable(1f) }
     LaunchedEffect(confirmAt) {
         if (confirmAt == 0L) return@LaunchedEffect
@@ -123,69 +198,10 @@ fun CameraScreen(
             .fillMaxSize()
             .onSizeChanged { viewW = it.width; viewH = it.height }
     ) {
-        // --- Camera Preview ---
         AndroidView(
             modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                PreviewView(ctx).apply {
-                    layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT
-                    )
-                    scaleType = PreviewView.ScaleType.FIT_CENTER
-                }
-            },
-            update = { pv ->
-                val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-                cameraProviderFuture.addListener({
-                    val cameraProvider = cameraProviderFuture.get()
-                    val rotation = pv.display.rotation
-                    val resolutionSelector = ResolutionSelector.Builder()
-                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-                        .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
-                        .build()
+            factory = { previewView })
 
-                    val preview = Preview.Builder()
-                        .setResolutionSelector(resolutionSelector)
-                        .setTargetRotation(rotation)
-                        .build().also { it.surfaceProvider = pv.surfaceProvider }
-
-                    val analyzer = ImageAnalysis.Builder()
-                        .setResolutionSelector(resolutionSelector)
-                        .setTargetRotation(rotation)
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setImageQueueDepth(3)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                        .build().also { analysis ->
-                            analysis.setAnalyzer(
-                                Dispatchers.Default.asExecutor(),
-                                DocumentAnalyzerTwo(
-                                    onFrameSize = { w, h -> viewModel.setFrameSize(w, h) },
-                                    onDebug = { bmp, text ->
-                                        viewModel.setDebugFrame(bmp)
-                                        viewModel.setStatus(text)
-                                    },
-                                    onResult = { poly, cropped, thumbnail ->
-                                        viewModel.onAnalyzerResult(poly, cropped, thumbnail)
-                                    }
-                                )
-                            )
-                        }
-
-                    try {
-                        cameraProvider.unbindAll()
-                        cameraProvider.bindToLifecycle(
-                            (context as ComponentActivity),
-                            CameraSelector.DEFAULT_BACK_CAMERA,
-                            preview,
-                            analyzer
-                        )
-                    } catch (_: Exception) { }
-                }, ContextCompat.getMainExecutor(context))
-            }
-        )
-
-        // --- Верхние подсказки ---
         Column(
             Modifier
                 .fillMaxWidth()
@@ -194,40 +210,27 @@ fun CameraScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             if (status.isNotEmpty()) {
-                Surface(
-                    color = Color(0x88000000),
-                    shape = MaterialTheme.shapes.small
-                ) {
-                    Text(
-                        text = status,
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                    )
+                Surface(color = Color(0x88000000), shape = MaterialTheme.shapes.small) {
+                    Text(status, color = Color.White, modifier = Modifier.padding(12.dp, 6.dp))
                 }
             }
-
-            // Лок-прогресс
             if (lockProgress > 0f && confirmAt == 0L) {
                 Spacer(Modifier.height(6.dp))
                 LinearProgressIndicator(
                     progress = { lockProgress },
-                    modifier = Modifier
-                        .width(200.dp)
-                        .height(6.dp),
+                    modifier = Modifier.width(200.dp).height(6.dp),
                     color = Color(0xFF00E676),
                     trackColor = Color.White.copy(alpha = 0.25f)
                 )
                 Spacer(Modifier.height(2.dp))
                 Text("Фокусируемся на документе…", color = Color.White)
             }
-
             if (pages.isNotEmpty() && lastCapturedAt != 0L) {
                 Spacer(Modifier.height(6.dp))
                 AssistChip(onClick = {}, label = { Text("Добавлено: ${pages.size}") })
             }
         }
 
-        // --- Оверлей: полигон, волна и confirm-стропы ---
         Canvas(Modifier.fillMaxSize()) {
             val src = frameSize
             val poly = polygonRaw
@@ -239,29 +242,19 @@ fun CameraScreen(
 
                 fun mapPts(p: List<Pair<Float, Float>>) =
                     p.map { (x, y) -> Offset(x * scale + dx, y * scale + dy) }
-
                 val pts = mapPts(poly)
 
-                // Цвет полигона в зависимости от lockProgress
-                val base = Color(0xFFFFEB3B) // жёлтый при поиске
-                val target = Color(0xFF00E676) // зелёный при готовности
-                fun lerpColor(a: Color, b: Color, t: Float): Color =
-                    Color(
-                        red = a.red + (b.red - a.red) * t,
-                        green = a.green + (b.green - a.green) * t,
-                        blue = a.blue + (b.blue - a.blue) * t,
-                        alpha = 1f
-                    )
+                val base = Color(0xFFFFEB3B)
+                val target = Color(0xFF00E676)
+                fun lerpColor(a: Color, b: Color, t: Float) =
+                    Color(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t)
                 val polyColor = if (confirmAt > 0L) target else lerpColor(base, target, lockProgress)
 
-                // Контур
                 for (i in pts.indices) {
-                    val a = pts[i]
-                    val b = pts[(i + 1) % pts.size]
+                    val a = pts[i]; val b = pts[(i + 1) % pts.size]
                     drawLine(polyColor, a, b, strokeWidth = 6f)
                 }
 
-                // Волна после захвата
                 if (wavePolygon.isNotEmpty() && waveProgress.value < 1f) {
                     val wPts = mapPts(wavePolygon)
                     val path = Path().apply {
@@ -272,11 +265,10 @@ fun CameraScreen(
                     val p = waveProgress.value
                     val alpha1 = (1f - p).coerceIn(0f, 1f)
                     val alpha2 = (0.6f * (1f - p)).coerceIn(0f, 1f)
-                    drawPath(path, color = Color(0xFF00E676).copy(alpha = alpha1), style = Stroke(width = 6f + 10f * p))
-                    drawPath(path, color = Color(0xFF00E676).copy(alpha = alpha2), style = Stroke(width = 6f + 22f * p))
+                    drawPath(path, Color(0xFF00E676).copy(alpha = alpha1), style = Stroke(6f + 10f * p))
+                    drawPath(path, Color(0xFF00E676).copy(alpha = alpha2), style = Stroke(6f + 22f * p))
                 }
 
-                // Confirm-анимация: скан-стропы внутри полигона (клип по полигону)
                 if (confirmAt > 0L && confirmProgress.value < 1f) {
                     val path = Path().apply {
                         moveTo(pts[0].x, pts[0].y)
@@ -285,7 +277,6 @@ fun CameraScreen(
                     }
                     val p = confirmProgress.value
                     clipPath(path) {
-                        // рисуем 4 вертикальные "полосы" сканера, которые едут слева направо
                         val left = pts.minOf { it.x }
                         val right = pts.maxOf { it.x }
                         val top = pts.minOf { it.y }
@@ -297,7 +288,6 @@ fun CameraScreen(
                         val startX = left - total
                         val travel = width + total * 2
                         val baseX = startX + travel * p
-
                         repeat(4) { i ->
                             val x = baseX + i * (barW + gap)
                             drawRect(
@@ -311,7 +301,6 @@ fun CameraScreen(
             }
         }
 
-        // --- 🍏 Анимация: превью в центр → в угол ---
         if (animBmp != null && viewW > 0 && viewH > 0) {
             val p = animProgress.value.coerceIn(0f, 1f)
             val aspect = animBmp!!.width.toFloat() / animBmp!!.height.toFloat()
@@ -325,6 +314,7 @@ fun CameraScreen(
             val endX = viewW - endW - with(density) { 16.dp.toPx() }
             val endY = viewH - endH - with(density) { 16.dp.toPx() }
 
+            fun flerp(a: Float, b: Float, t: Float) = a + (b - a) * t
             val curW = flerp(startW, endW, p)
             val curH = flerp(startH, endH, p)
             val curX = flerp(startX, endX, p)
@@ -345,7 +335,6 @@ fun CameraScreen(
             )
         }
 
-        // --- Нижняя панель: мини превью от анализатора ---
         Row(
             Modifier
                 .align(Alignment.BottomStart)
@@ -356,17 +345,12 @@ fun CameraScreen(
         ) {
             val mini = debug ?: thumb
             if (mini != null) {
-                Image(
-                    bitmap = mini.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = Modifier.size(88.dp)
-                )
+                Image(bitmap = mini.asImageBitmap(), contentDescription = null, modifier = Modifier.size(88.dp))
             } else {
                 Text("Нет предпросмотра", color = Color.White)
             }
         }
 
-        // --- Мини-стопка + Undo ---
         Column(
             Modifier
                 .align(Alignment.BottomEnd)
@@ -420,7 +404,6 @@ fun CameraScreen(
             }
         }
 
-        // --- Очистить сессию ---
         if (pages.isNotEmpty()) {
             TextButton(
                 onClick = { viewModel.clearSession() },
@@ -429,5 +412,3 @@ fun CameraScreen(
         }
     }
 }
-
-private fun flerp(a: Float, b: Float, t: Float) = a + (b - a) * t

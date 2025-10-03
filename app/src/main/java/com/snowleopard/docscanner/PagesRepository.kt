@@ -7,6 +7,7 @@ import androidx.core.graphics.scale
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 data class PdfOptions(
@@ -32,7 +33,12 @@ class PagesRepository(private val context: Context) {
      * Сохраняем страницу как есть. НИКАКОЙ авто-ориентации.
      */
     fun savePage(original: Bitmap, preferPortrait: Boolean = false): ScannedPage {
-        val bmp = original
+        val maxSide = 3000
+        var bmp = original
+        if (max(bmp.width, bmp.height) > maxSide) {
+            val scale = maxSide.toFloat() / max(bmp.width, bmp.height)
+            bmp = bmp.scale((bmp.width * scale).toInt(), (bmp.height * scale).toInt())
+        }
 
         val id = UUID.randomUUID().toString()
         val index = counter++
