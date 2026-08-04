@@ -46,7 +46,6 @@ import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.snowleopard.docscanner.core.imaging.DocumentAnalyzerTwo
 import com.snowleopard.docscanner.feature.viewmodels.ScanViewModel
-import kotlinx.coroutines.delay
 import org.koin.androidx.compose.koinViewModel
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -124,7 +123,12 @@ fun CameraScreen(
 
         val analysisSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(1600, 1200),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER,
+                )
+            )
             .build()
 
         val analysis = ImageAnalysis.Builder()
@@ -141,8 +145,8 @@ fun CameraScreen(
                 viewModel.setDebugFrame(bmp)
                 viewModel.setStatus(text)
             },
-            onResult = { poly, cropped, thumbnail ->
-                viewModel.onAnalyzerResult(poly, cropped, thumbnail)
+            onResult = { result ->
+                viewModel.onAnalyzerResult(result)
             }
         )
         analysis.setAnalyzer(cameraExecutor, analyzer)
@@ -158,15 +162,6 @@ fun CameraScreen(
             runCatching { cameraProvider.unbindAll() }
             runCatching { cameraExecutor.shutdown() }
         }
-    }
-
-    // UI state
-    var showAdded by remember(lastCapturedAt) { mutableStateOf(lastCapturedAt != 0L) }
-    LaunchedEffect(lastCapturedAt) {
-        if (lastCapturedAt == 0L) return@LaunchedEffect
-        showAdded = true
-        delay(1200)
-        showAdded = false
     }
 
     val waveProgress = remember { Animatable(1f) }
@@ -217,7 +212,7 @@ fun CameraScreen(
                     Text(status, color = Color.White, modifier = Modifier.padding(12.dp, 6.dp))
                 }
             }
-            if (lockProgress > 0f && confirmAt == 0L) {
+            if (lockProgress > 0f) {
                 Spacer(Modifier.height(6.dp))
                 LinearProgressIndicator(
                     progress = { lockProgress },
@@ -287,13 +282,13 @@ fun CameraScreen(
                         val bottom = pts.maxOf { it.y }
                         val width = right - left
                         val barW = width / 10f
-                        val gap = barW
-                        val total = (barW + gap) * 4
+                        val stripeStep = barW * 2f
+                        val total = stripeStep * 4f
                         val startX = left - total
                         val travel = width + total * 2
                         val baseX = startX + travel * p
                         repeat(4) { i ->
-                            val x = baseX + i * (barW + gap)
+                            val x = baseX + i * stripeStep
                             drawRect(
                                 color = Color.White.copy(alpha = 0.18f),
                                 topLeft = Offset(x, top),
@@ -325,10 +320,10 @@ fun CameraScreen(
             val curX = flerp(startX, endX, p)
             val curY = flerp(startY, endY, p)
 
-            val curWdp = with(density) { (curW / density.density).dp }
-            val curHdp = with(density) { (curH / density.density).dp }
-            val curXdp = with(density) { (curX / density.density).dp }
-            val curYdp = with(density) { (curY / density.density).dp }
+            val curWdp = (curW / density.density).dp
+            val curHdp = (curH / density.density).dp
+            val curXdp = (curX / density.density).dp
+            val curYdp = (curY / density.density).dp
 
             Image(
                 bitmap = animBmp!!.asImageBitmap(),

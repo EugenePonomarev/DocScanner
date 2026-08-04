@@ -14,11 +14,13 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.hypot
-import kotlin.math.max
 import kotlin.math.sqrt
 import androidx.core.graphics.scale
 import com.snowleopard.docscanner.core.data.model.ScannedPage
+import com.snowleopard.docscanner.core.imaging.DocumentDetectionResult
 import kotlinx.coroutines.flow.StateFlow
+import kotlin.time.Duration.Companion.milliseconds
+import kotlinx.coroutines.Job
 
 class ScanViewModel(
     private val repo: PagesRepository,
@@ -55,17 +57,13 @@ class ScanViewModel(
 
     // Freeze/duplicate FSM
     private val _captureFreeze = MutableStateFlow(false)
-    val captureFreeze = _captureFreeze.asStateFlow()
     private var frozenAt: Long = 0L
     private var framesWithoutDoc: Int = 0
 
-    private data class CaptureSig(
-        val hash: Long,
-        val time: Long,
-        val centroidN: Pair<Float, Float>,
-        val areaN: Float,
-    )
-    private var lastSig: CaptureSig? = null
+    private data class CaptureSig(val hash: Long)
+
+    private val capturedSignatures = mutableListOf<CaptureSig>()
+    private val maxStoredSignatures = 20
 
     private var lastPolyAreaNorm: Float = 0f
     private var lastPolyCentroid: Pair<Float, Float>? = null
@@ -82,6 +80,10 @@ class ScanViewModel(
     private var latestCropped: Bitmap? = null
     private var latestCroppedAt: Long = 0L
 
+    private var latestCroppedPolygon: List<Pair<Float, Float>>? = null
+
+    private var confirmJob: Job? = null
+
     // Params
     private val captureCooldownMs = 900L
     private val minFreezeMs = 1400L
@@ -90,18 +92,14 @@ class ScanViewModel(
     private val moveEpsNormalized = 0.02f
     private val angleMin = 0.60
     private val aspectMin = 0.35
-    private val areaMinNorm = 0.08f
+    private val areaMinNorm = 0.035f
 
-    private val lockFramesRequired = 8
-    private val lockDecay = 0.18f
+    private val lockFramesRequired = 6
 
-    private val confirmDurationMs = 380L
+    private val confirmDurationMs = 420L
     private val acceptStalenessMs = 2200L
-
-    private val dupTimeWindowMs = 2000L
     private val dupHashHammingThresh = 5
-    private val dupCentroidShiftThresh = 0.03f
-    private val dupAreaRelDiffThresh = 0.12f
+
 
     fun setStatus(s: String) { _status.value = s }
     fun setDebugFrame(bmp: Bitmap?) { _debugFrame.value = bmp }
@@ -111,68 +109,169 @@ class ScanViewModel(
         if (thumb != null) _liveThumbnail.value = thumb
     }
 
-    fun onAnalyzerResult(polygon: List<Pair<Float, Float>>, cropped: Bitmap?, thumbnail: Bitmap?) {
-        updateOverlay(polygon, thumbnail)
-        if (cropped != null) {
-            latestCropped = cropped
-            latestCroppedAt = System.currentTimeMillis()
+    fun onAnalyzerResult(result: DocumentDetectionResult) {
+        val validPolygon = if (result.qualityAccepted) {
+            result.polygon
+        } else {
+            emptyList()
         }
+
+        val captureReady = result.qualityAccepted && result.cropped != null
+
+        // Прогресс разрешено накапливать только тогда,
+        // когда анализатор уже сформировал стабильный crop.
+        val lockPolygon = if (captureReady) {
+            result.polygon
+        } else {
+            emptyList()
+        }
+
+        updateOverlay(
+            polygon = validPolygon,
+            thumb = result.thumbnail,
+        )
+
+        if (captureReady) {
+            latestCropped = result.cropped
+            latestCroppedPolygon = result.polygon
+            latestCroppedAt = System.currentTimeMillis()
+        } else {
+            latestCropped = null
+            latestCroppedPolygon = null
+            latestCroppedAt = 0L
+        }
+
         if (!_captureFreeze.value) {
-            updateLockProgress(polygon)
+            updateLockProgress(lockPolygon)
             checkConfirmAndCapture()
         } else {
             _lockProgress.value = 0f
-            maybeUnfreeze(polygon)
+            maybeUnfreeze(validPolygon)
         }
     }
 
-    private fun updateLockProgress(poly: List<Pair<Float, Float>>) {
-        val fs = _frameSize.value ?: return
-        if (poly.size < 4) {
-            stableFrames = 0
+    private fun cancelPendingConfirmation() {
+        confirmJob?.cancel()
+        confirmJob = null
+        _confirmAt.value = 0L
+    }
+
+    private fun resetLockProgress(clearPrevious: Boolean = true) {
+        stableFrames = 0
+        _lockProgress.value = 0f
+
+        if (clearPrevious) {
             prevPoly = null
-            _lockProgress.value = max(0f, _lockProgress.value - lockDecay)
+        }
+
+        cancelPendingConfirmation()
+    }
+
+    private fun updateLockProgress(poly: List<Pair<Float, Float>>) {
+        val fs = _frameSize.value ?: run {
+            resetLockProgress()
             return
         }
+
+        if (poly.size < 4) {
+            resetLockProgress()
+            return
+        }
+
         val (w, h) = fs
-        val diag = hypot(w.toDouble(), h.toDouble()).toFloat().coerceAtLeast(1f)
-        val areaNorm = (polygonArea(poly) / (w.toFloat() * h.toFloat())).coerceIn(0f, 1f)
+        val diag = hypot(
+            w.toDouble(),
+            h.toDouble(),
+        ).toFloat().coerceAtLeast(1f)
+
+        val areaNorm = (
+                polygonArea(poly) / (w.toFloat() * h.toFloat())
+                ).coerceIn(0f, 1f)
+
         val centroid = polygonCentroid(poly)
         val angles = rightAngleScore(poly)
         val aspect = aspectA4Score(poly)
-        val moved = prevPoly?.let { distance(centroid, polygonCentroid(it)) / diag } ?: 1f
 
-        val geometryOk = angles >= angleMin && aspect >= aspectMin && areaNorm >= areaMinNorm
-        val stable = moved < moveEpsNormalized
+        val previousPoly = prevPoly
+        val moved = previousPoly?.let {
+            distance(centroid, polygonCentroid(it)) / diag
+        } ?: Float.POSITIVE_INFINITY
+
+        val geometryOk =
+            angles >= angleMin &&
+                    aspect >= aspectMin &&
+                    areaNorm >= areaMinNorm
+
+        if (!geometryOk) {
+            resetLockProgress()
+            return
+        }
 
         prevPoly = poly
         lastPolyAreaNorm = areaNorm
         lastPolyCentroid = centroid
 
-        if (geometryOk && stable) {
-            stableFrames++
-            val step = 1f / lockFramesRequired
-            _lockProgress.value = (_lockProgress.value + step).coerceAtMost(1f)
-        } else {
+        // Первый корректный кадр только запоминаем.
+        if (previousPoly == null || moved >= moveEpsNormalized) {
             stableFrames = 0
-            _lockProgress.value = max(0f, _lockProgress.value - lockDecay)
+            _lockProgress.value = 0f
+            cancelPendingConfirmation()
+            return
         }
+
+        stableFrames++
+
+        val step = 1f / lockFramesRequired
+        _lockProgress.value = (
+                _lockProgress.value + step
+                ).coerceAtMost(1f)
     }
 
     private fun checkConfirmAndCapture() {
-        if (_lockProgress.value >= 1f && _confirmAt.value == 0L) {
-            _confirmAt.value = System.currentTimeMillis()
-            viewModelScope.launch {
-                delay(confirmDurationMs)
-                val stillValid = _lockProgress.value >= 0.8f && !_captureFreeze.value
-                val recentCropped = (System.currentTimeMillis() - latestCroppedAt) <= acceptStalenessMs
-                val bmp = latestCropped
-                if (stillValid && recentCropped && bmp != null) {
-                    performCapture(bmp, prevPoly ?: emptyList())
+        if (
+            _lockProgress.value < 1f ||
+            _confirmAt.value != 0L ||
+            _captureFreeze.value ||
+            latestCropped == null
+        ) {
+            return
+        }
+
+        val startedAt = System.currentTimeMillis()
+        val cropAtStart = latestCroppedAt
+
+        _confirmAt.value = startedAt
+
+        confirmJob?.cancel()
+        confirmJob = viewModelScope.launch {
+            try {
+                delay(confirmDurationMs.milliseconds)
+
+                val bitmap = latestCropped
+
+                if (bitmap != null) {
+                    val stillValid =
+                        _lockProgress.value >= 1f &&
+                                !_captureFreeze.value &&
+                                latestCroppedAt >= cropAtStart &&
+                                System.currentTimeMillis() - latestCroppedAt <= acceptStalenessMs
+
+                    if (stillValid) {
+                        performCapture(
+                            cropped = bitmap,
+                            polygonForWave = latestCroppedPolygon
+                                ?: prevPoly
+                                ?: emptyList(),
+                        )
+                    }
                 }
-                _confirmAt.value = 0L
-                _lockProgress.value = 0f
-                stableFrames = 0
+            } finally {
+                if (_confirmAt.value == startedAt) {
+                    _confirmAt.value = 0L
+                    _lockProgress.value = 0f
+                    stableFrames = 0
+                    confirmJob = null
+                }
             }
         }
     }
@@ -185,26 +284,36 @@ class ScanViewModel(
         _captureInProgress.value = true
         viewModelScope.launch {
             val newHash = withContext(Dispatchers.Default) { averageHash64(cropped) }
-            val metrics = currentPolyMetrics(polygonForWave)
-            val duplicate = isLikelyDuplicate(newHash, metrics, now)
-            if (!duplicate) {
+            val duplicate = isLikelyDuplicate(newHash)
+
+            if (duplicate) {
+                // Не пытаемся бесконечно захватывать уже сохранённую страницу.
+                enableFreeze()
+            } else {
                 val page = withContext(Dispatchers.Default) {
                     repo.savePage(cropped, preferPortrait = true)
                 }
+
                 _wavePolygon.value = polygonForWave
                 _lastCapturedAt.value = now
-                store.add(page) // <— добавляем в общее хранилище
-                enableFreeze(CaptureSig(newHash, now, metrics.centroidN, metrics.areaN))
+                store.add(page)
+
+                capturedSignatures += CaptureSig(hash = newHash)
+
+                if (capturedSignatures.size > maxStoredSignatures) {
+                    capturedSignatures.removeAt(0)
+                }
+
+                enableFreeze()
             }
             _captureInProgress.value = false
         }
     }
 
-    private fun enableFreeze(sig: CaptureSig) {
+    private fun enableFreeze() {
         _captureFreeze.value = true
         frozenAt = System.currentTimeMillis()
         framesWithoutDoc = 0
-        lastSig = sig
     }
 
     private fun maybeUnfreeze(currentPoly: List<Pair<Float, Float>>) {
@@ -215,26 +324,34 @@ class ScanViewModel(
         val hasDoc = currentPoly.size >= 4
         if (!hasDoc) {
             framesWithoutDoc++
-            if (framesWithoutDoc >= requireDocAbsenceFrames) disableFreeze(true)
+            if (framesWithoutDoc >= requireDocAbsenceFrames) disableFreeze()
             return
         } else framesWithoutDoc = 0
 
-        if (fs != null && lastPolyCentroid != null) {
+        val lastCentroid = lastPolyCentroid
+
+        if (fs != null && lastCentroid != null) {
             val (w, h) = fs
-            val diag = hypot(w.toDouble(), h.toDouble()).toFloat().coerceAtLeast(1f)
-            val curAreaNorm = (polygonArea(currentPoly) / (w.toFloat() * h.toFloat())).coerceIn(0f, 1f)
+            val diag = hypot(
+                w.toDouble(),
+                h.toDouble(),
+            ).toFloat().coerceAtLeast(1f)
+
+            val curAreaNorm = (
+                    polygonArea(currentPoly) / (w.toFloat() * h.toFloat())
+                    ).coerceIn(0f, 1f)
+
             val curCentroid = polygonCentroid(currentPoly)
-            val shift = distance(curCentroid, lastPolyCentroid!!) / diag
+            val shift = distance(curCentroid, lastCentroid) / diag
             val areaRelChange = if (lastPolyAreaNorm > 1e-6f)
                 abs(curAreaNorm - lastPolyAreaNorm) / lastPolyAreaNorm else 1f
-            if (shift > 0.10f || areaRelChange > 0.25f) disableFreeze(true)
+            if (shift > 0.10f || areaRelChange > 0.25f) disableFreeze()
         }
     }
 
-    private fun disableFreeze(resetSignature: Boolean) {
+    private fun disableFreeze() {
         _captureFreeze.value = false
         framesWithoutDoc = 0
-        if (resetSignature) lastSig = null
     }
 
     fun removeLastPage() {
@@ -255,36 +372,23 @@ class ScanViewModel(
                 prevPoly = null
                 stableFrames = 0
                 _lockProgress.value = 0f
-                _confirmAt.value = 0L
+                cancelPendingConfirmation()
+                latestCroppedAt = 0L
                 latestCropped = null
-                lastSig = null
+                capturedSignatures.clear()
+                latestCroppedPolygon = null
             }
         }
     }
 
     // ----- Utils for duplicate -----
-    private data class PolyMetrics(val centroidN: Pair<Float, Float>, val areaN: Float)
-    private fun currentPolyMetrics(poly: List<Pair<Float, Float>>): PolyMetrics {
-        val fs = _frameSize.value
-        val (w, h) = fs ?: (1 to 1)
-        val areaN = (polygonArea(poly) / (w.toFloat() * h.toFloat())).coerceIn(0f, 1f)
-        val centroid = polygonCentroid(poly)
-        val diag = hypot(w.toDouble(), h.toDouble()).toFloat().coerceAtLeast(1f)
-        val cxN = centroid.first / diag
-        val cyN = centroid.second / diag
-        return PolyMetrics(cxN to cyN, areaN)
-    }
-
-    private fun isLikelyDuplicate(newHash: Long, metrics: PolyMetrics, now: Long): Boolean {
-        val sig = lastSig ?: return false
-        if (now - sig.time > dupTimeWindowMs) return false
-        val hamming = hammingDistance(newHash, sig.hash)
-        val dc = sqrt(
-            (metrics.centroidN.first - sig.centroidN.first) * (metrics.centroidN.first - sig.centroidN.first) +
-                    (metrics.centroidN.second - sig.centroidN.second) * (metrics.centroidN.second - sig.centroidN.second)
-        )
-        val da = if (sig.areaN > 1e-6f) abs(metrics.areaN - sig.areaN) / sig.areaN else 1f
-        return (hamming <= dupHashHammingThresh) && (dc < dupCentroidShiftThresh) && (da < dupAreaRelDiffThresh)
+    private fun isLikelyDuplicate(newHash: Long): Boolean {
+        return capturedSignatures.any { signature ->
+            hammingDistance(
+                newHash,
+                signature.hash,
+            ) <= dupHashHammingThresh
+        }
     }
 
     private fun polygonArea(poly: List<Pair<Float, Float>>): Float {
@@ -331,12 +435,19 @@ class ScanViewModel(
             return Math.toDegrees(acos(cos))
         }
         if (poly.size < 4) return 0.0
-        val p = poly
         val angs = listOf(
-            angle(p[3].first, p[3].second, p[0].first, p[0].second, p[1].first, p[1].second),
-            angle(p[0].first, p[0].second, p[1].first, p[1].second, p[2].first, p[2].second),
-            angle(p[1].first, p[1].second, p[2].first, p[2].second, p[3].first, p[3].second),
-            angle(p[2].first, p[2].second, p[3].first, p[3].second, p[0].first, p[0].second)
+            angle(
+                poly[3].first, poly[3].second, poly[0].first,
+                poly[0].second, poly[1].first, poly[1].second),
+            angle(
+                poly[0].first, poly[0].second, poly[1].first,
+                poly[1].second, poly[2].first, poly[2].second),
+            angle(
+                poly[1].first, poly[1].second, poly[2].first,
+                poly[2].second, poly[3].first, poly[3].second),
+            angle(
+                poly[2].first, poly[2].second, poly[3].first,
+                poly[3].second, poly[0].first, poly[0].second)
         )
         val scores = angs.map { 1.0 - (abs(it - 90.0) / 20.0).coerceIn(0.0, 1.0) }
         return scores.average()
