@@ -92,13 +92,19 @@ class PagesRepository(private val context: Context) {
         FileOutputStream(page.thumbFile).use { thumb.compress(Bitmap.CompressFormat.JPEG, 85, it) }
         page.thumbFile.setLastModified(System.currentTimeMillis())
 
+        val rotatedWidth = rotated.width
+        val rotatedHeight = rotated.height
+
         // free bitmaps
         if (!src.isRecycled) src.recycle()
         if (!rotated.isRecycled) rotated.recycle()
         if (!thumb.isRecycled) thumb.recycle()
 
         // return updated dims so StateFlow emits new object
-        return page.copy(width = rotated.width, height = rotated.height)
+        return page.copy(
+            width = rotatedWidth,
+            height = rotatedHeight,
+        )
     }
 
     fun buildPdf(pages: List<ScannedPage>, options: PdfOptions): File {
