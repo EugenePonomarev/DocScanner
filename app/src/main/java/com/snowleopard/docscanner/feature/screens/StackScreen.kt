@@ -127,7 +127,7 @@ fun StackScreen(
                                                 dpi = 300,
                                                 marginMm = 6,
                                                 jpegQuality = 92,
-                                                autoRotateToPortrait = true
+                                                autoRotateToPortrait = false
                                             )
                                         )
                                     }.getOrNull()
