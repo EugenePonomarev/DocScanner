@@ -17,11 +17,12 @@ import org.opencv.imgproc.Imgproc
 import kotlin.math.*
 
 private const val TAG = "DocAnalyzerTwo"
+private const val THUMBNAIL_WIDTH = 240
 
 class DocumentAnalyzerTwo(
     private val onFrameSize: (w: Int, h: Int) -> Unit,
     private val onDebug: (bmp: Bitmap?, status: String) -> Unit,
-    private val onResult: (polygon: List<Pair<Float, Float>>, cropped: Bitmap?, thumbnail: Bitmap?) -> Unit,
+    private val onResult: (DocumentDetectionResult) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
     // --- Timing / throttling ---
@@ -37,8 +38,7 @@ class DocumentAnalyzerTwo(
     private val alpha = 0.22
     private val minScoreToAccept = 0.34
     private val keepPrevIfBetterDelta = 0.08
-    private val minStableFramesToCrop = 2
-    private val fastLockScore = 0.65
+    private val minStableFramesToCrop = 4
     private val movementEpsNormalized = 0.010
 
     // --- ROI speed-ups ---
@@ -52,9 +52,12 @@ class DocumentAnalyzerTwo(
 
     // --- Hough ---
     private val houghAngleTol = 15.0
-    private val houghMinLineLenRatio = 0.40
+    private val houghMinLineLenRatio = 0.25
+    private val minCandidateAreaRatio = 0.035
+    private val minCandidatePerimeterRatio = 0.45
 
     private enum class EnhanceProfile { NONE, SOFT, BW }
+
     private val enhanceProfile = EnhanceProfile.NONE
 
     // --- Profiling ---
@@ -67,16 +70,26 @@ class DocumentAnalyzerTwo(
         val tHough: T = T(),
         val tTotal: T = T(),
     )
+
     private val times = Times()
+
+    private val maxRoiMisses = 3
+
+    private val maxTrackingJumpNorm = 0.22
+    private val minTrackingAreaRatio = 0.35
+    private val maxTrackingAreaRatio = 2.8
+    private val debugEveryFrames = 5
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(image: ImageProxy) {
         val now = System.currentTimeMillis()
-        if (now - lastAnalyzeAt < minAnalyzeIntervalMs) { image.close(); return }
+        if (now - lastAnalyzeAt < minAnalyzeIntervalMs) {
+            image.close(); return
+        }
         lastAnalyzeAt = now
         frameIndex++
 
-        var status = "analyze..."
+        var status: String
         try {
             val t0 = System.nanoTime()
 
@@ -84,8 +97,7 @@ class DocumentAnalyzerTwo(
             val graySrc = yPlaneToGrayMat(image)
             if (graySrc == null) {
                 onDebug(null, "no gray")
-                onResult(emptyList(), null, null)
-                image.close()
+                onResult(DocumentDetectionResult())
                 return
             }
 
@@ -111,15 +123,29 @@ class DocumentAnalyzerTwo(
 
             status = out.status +
                     " | t(ms):R=${times.tResize.ms} P=${times.tPrep.ms} E=${times.tEdges.ms} C=${times.tCnt.ms} H=${times.tHough.ms} T=${times.tTotal.ms}"
-            onDebug(out.debugBmp, status)
+            if (frameIndex % debugEveryFrames == 0) {
+                onDebug(out.debugBmp, status)
+            }
 
-            val thumb = out.cropped?.let { makeThumbnail(it, 240) }
-            onResult(out.polygon.map { it.x.toFloat() to it.y.toFloat() }, out.cropped, thumb)
+            val thumb = out.cropped?.let { makeThumbnail(it) }
+            onResult(
+                DocumentDetectionResult(
+                    polygon = out.polygon.map {
+                        it.x.toFloat() to it.y.toFloat()
+                    },
+                    cropped = out.cropped,
+                    thumbnail = thumb,
+                    qualityAccepted = out.qualityAccepted,
+                    confidence = out.confidence
+                        .toFloat()
+                        .coerceIn(0f, 1f),
+                )
+            )
         } catch (t: Throwable) {
             status = "error: ${t.message}"
             Log.e(TAG, "analyze error", t)
             onDebug(null, status)
-            onResult(emptyList(), null, null)
+            onResult(DocumentDetectionResult())
         } finally {
             image.close()
         }
@@ -132,6 +158,8 @@ class DocumentAnalyzerTwo(
         val cropped: Bitmap?,
         val debugBmp: Bitmap?,
         val status: String,
+        val qualityAccepted: Boolean,
+        val confidence: Double,
     )
 
     private fun detectAndCropFromGray(
@@ -155,11 +183,13 @@ class DocumentAnalyzerTwo(
         times.tResize.ms = ((System.nanoTime() - tR0) / 1_000_000).coerceAtLeast(0)
 
         // 2) ROI around previous quad
-        val useRoi = prevQuad != null
+        val useRoi = prevQuad != null && missCounter < maxRoiMisses
         val roiRectDown: Rect? = if (useRoi) {
             val q = prevQuad!!.map { p -> Point(p.x * scaleFull, p.y * scaleFull) }
-            val minX = q.minOf { it.x }; val maxX = q.maxOf { it.x }
-            val minY = q.minOf { it.y }; val maxY = q.maxOf { it.y }
+            val minX = q.minOf { it.x }
+            val maxX = q.maxOf { it.x }
+            val minY = q.minOf { it.y }
+            val maxY = q.maxOf { it.y }
             val pad = (max(maxX - minX, maxY - minY) * roiPadFrac).coerceAtLeast(12.0)
             val x0 = floor((minX - pad).coerceAtLeast(0.0)).toInt()
             val y0 = floor((minY - pad).coerceAtLeast(0.0)).toInt()
@@ -238,18 +268,25 @@ class DocumentAnalyzerTwo(
         val tC0 = System.nanoTime()
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
-        Imgproc.findContours(comb, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        Imgproc.findContours(
+            comb,
+            contours,
+            hierarchy,
+            Imgproc.RETR_EXTERNAL,
+            Imgproc.CHAIN_APPROX_SIMPLE
+        )
 
         val frameAreaWork = (dwWork * dhWork).toDouble()
-        val areaMin = frameAreaWork * 0.08
-        val perimMin = (dwWork + dhWork) * 0.55
+        val areaMin = frameAreaWork * minCandidateAreaRatio
+        val perimMin = min(dwWork, dhWork) * minCandidatePerimeterRatio
 
         val sorted = contours.sortedByDescending { Imgproc.contourArea(it) }.take(5)
 
         var bestQuadWork: Array<Point>? = null
         var bestScore = -1.0
         var bestBrk = ScoreBreakdown()
-        var srcTag = if (useRoi) if (doHeavy) "contour-roi-H" else "contour-roi" else if (doHeavy) "contour-full-H" else "contour-full"
+        var srcTag =
+            if (useRoi) if (doHeavy) "contour-roi-H" else "contour-roi" else if (doHeavy) "contour-full-H" else "contour-full"
 
         for (c in sorted) {
             val area = Imgproc.contourArea(c)
@@ -269,9 +306,11 @@ class DocumentAnalyzerTwo(
             if (!Imgproc.isContourConvex(MatOfPoint(*quad))) continue
 
             val orderedWork = orderQuad(quad).toTypedArray()
-            val orderedFull = Array(4) { i -> workToDownFull(orderedWork[i]) } // to downFull for border score
+            val orderedFull =
+                Array(4) { i -> workToDownFull(orderedWork[i]) } // to downFull for border score
 
-            val breakdownFast = scoreQuadFast(orderedWork, orderedFull, area, frameAreaWork, dwFull, dhFull)
+            val breakdownFast =
+                scoreQuadFast(orderedWork, orderedFull, area, frameAreaWork, dwFull, dhFull)
             var score = combinedScoreFast(breakdownFast)
 
             val breakdown = if (score >= 0.25) {
@@ -296,11 +335,13 @@ class DocumentAnalyzerTwo(
             if (houghQuad != null) {
                 val rectArea = polygonArea(orderedList(houghQuad))
                 val orderedFull = Array(4) { i -> workToDownFull(houghQuad[i]) }
-                val breakdownFast = scoreQuadFast(houghQuad, orderedFull, rectArea, frameAreaWork, dwFull, dhFull)
+                val breakdownFast =
+                    scoreQuadFast(houghQuad, orderedFull, rectArea, frameAreaWork, dwFull, dhFull)
                 val edgeScore = edgeSupportScore(houghQuad, comb)
                 val breakdown = breakdownFast.copy(edge = edgeScore)
                 val score = combinedScore(breakdown)
-                val hValid = breakdown.border >= 0.08 && (breakdown.edge >= 0.10 || breakdown.rectangularity >= 0.80)
+                val hValid =
+                    breakdown.border >= 0.08 && (breakdown.edge >= 0.10 || breakdown.rectangularity >= 0.80)
                 if (hValid) {
                     bestQuadWork = houghQuad
                     bestScore = score
@@ -314,8 +355,15 @@ class DocumentAnalyzerTwo(
         // 6) Map back to src
         if (bestQuadWork == null) {
             missCounter++
-            val dbg = matToBitmap(comb)
-            // release mats safely
+
+            if (missCounter >= maxRoiMisses) {
+                prevQuad = null
+                prevScore = 0.0
+                stableFrames = 0
+            }
+
+            val dbg = debugBitmapIfNeeded(comb)
+
             if (grayWork !== grayDownFull) grayWork.release()
             tmpResize?.release()
             grayRoi?.release()
@@ -326,54 +374,153 @@ class DocumentAnalyzerTwo(
             k3.release()
             grayDownFull.release()
 
-            return DetectOut(emptyList(), null, dbg, "no quad ($srcTag) miss=$missCounter")
-        } else {
-            missCounter = 0
+            return DetectOut(
+                polygon = emptyList(),
+                cropped = null,
+                debugBmp = dbg,
+                status = "no quad ($srcTag) miss=$missCounter",
+                qualityAccepted = false,
+                confidence = 0.0,
+            )
         }
 
         val bestQuadDownFull = bestQuadWork.map(::workToDownFull).toTypedArray()
-        val toSrc: (Point) -> Point = { p -> if (scaleFull < 1.0) Point(p.x / scaleFull, p.y / scaleFull) else Point(p.x, p.y) }
+        val toSrc: (Point) -> Point = { p ->
+            if (scaleFull < 1.0) Point(p.x / scaleFull, p.y / scaleFull) else Point(
+                p.x,
+                p.y
+            )
+        }
         val currentQuad = bestQuadDownFull.map(toSrc).toTypedArray()
 
-        // 7) Stabilization / decision
-        val usePrevKeep = prevQuad != null && (bestScore + keepPrevIfBetterDelta) < prevScore
-        val smoothed = if (prevQuad != null && !usePrevKeep) {
-            Array(4) { i -> lerp(prevQuad!![i], currentQuad[i], alpha) }
-        } else prevQuad ?: currentQuad
+        // 7) Quality gate + stabilization
 
-        val moveNorm = if (prevQuad != null) {
-            smoothed.indices.map { i -> dist(smoothed[i], prevQuad!![i]) }.average() / hypot(srcW.toDouble(), srcH.toDouble())
-        } else 1.0
+        val geomStrong = (
+                bestBrk.rectangularity > 0.68 &&
+                        bestBrk.rightAngles > 0.72 &&
+                        bestBrk.size > 0.12
+                )
 
-        prevQuad = smoothed
-        prevScore = if (usePrevKeep) prevScore else max(prevScore * (1 - alpha), bestScore)
-
-        val needStable = if (bestScore >= fastLockScore && moveNorm < movementEpsNormalized * 0.7) 1 else minStableFramesToCrop
-        stableFrames = if (bestScore >= minScoreToAccept && moveNorm < movementEpsNormalized) {
-            (stableFrames + 1).coerceAtMost(8)
-        } else 0
-
-        val geomStrong = (bestBrk.rectangularity > 0.68 && bestBrk.rightAngles > 0.72 && bestBrk.size > 0.12)
         val borderOk = bestBrk.border >= 0.06
-        val edgeOk = bestBrk.edge >= 0.09 || (geomStrong && bestBrk.border >= 0.05)
-        val acceptForCrop = (bestScore >= minScoreToAccept) && borderOk && edgeOk
-        val shouldCrop = acceptForCrop && stableFrames >= needStable
+
+        val edgeOk = (
+                bestBrk.edge >= 0.09 ||
+                        (geomStrong && bestBrk.border >= 0.05)
+                )
+
+        val baseQualityAccepted = (
+                bestScore >= minScoreToAccept &&
+                        borderOk &&
+                        edgeOk
+                )
+
+        val continuityAccepted = isCandidateConsistent(
+            currentQuad = currentQuad,
+            previousQuad = prevQuad,
+            frameWidth = srcW,
+            frameHeight = srcH,
+        )
+
+        val qualityAccepted = baseQualityAccepted &&
+                continuityAccepted
+
+        if (qualityAccepted) {
+            missCounter = 0
+        } else {
+            missCounter++
+
+            if (missCounter >= maxRoiMisses) {
+                prevQuad = null
+                prevScore = 0.0
+                stableFrames = 0
+            }
+        }
+
+        val previousQuad = prevQuad
+
+        val usePrevKeep = (
+                qualityAccepted &&
+                        previousQuad != null &&
+                        bestScore + keepPrevIfBetterDelta < prevScore
+                )
+
+
+        // Проверяем движение исходной найденной рамки,
+        // а не уже сглаженной.
+        val moveNorm = previousQuad?.let { previous ->
+            currentQuad.indices
+                .map { index ->
+                    dist(currentQuad[index], previous[index])
+                }
+                .average() / hypot(
+                srcW.toDouble(),
+                srcH.toDouble(),
+            )
+        } ?: 1.0
+
+        val smoothed = when {
+            !qualityAccepted -> previousQuad ?: currentQuad
+
+            previousQuad != null && !usePrevKeep -> {
+                Array(4) { index ->
+                    lerp(
+                        previousQuad[index],
+                        currentQuad[index],
+                    )
+                }
+            }
+
+            else -> previousQuad ?: currentQuad
+        }
+
+        if (qualityAccepted) {
+            prevQuad = smoothed
+            prevScore = max(
+                prevScore * (1 - alpha),
+                bestScore,
+            )
+        }
+
+        val needStable = minStableFramesToCrop
+
+        stableFrames = if (
+            qualityAccepted &&
+            bestScore >= minScoreToAccept &&
+            moveNorm < movementEpsNormalized
+        ) {
+            (stableFrames + 1).coerceAtMost(8)
+        } else {
+            0
+        }
+
+        val shouldCrop = qualityAccepted && stableFrames >= needStable
 
         var cropped: Bitmap? = null
         if (shouldCrop) {
             val color = colorSupplier()
-            cropped = if (color != null) {
+            cropped = (if (color != null) {
                 warpByQuadBitmap(color, smoothed)
             } else {
                 warpByQuadGray(grayFull, smoothed)
-            }?.let { applyPostproc(it, enhanceProfile) }
+            }).let { applyPostproc(it, enhanceProfile) }
         }
 
-        val dbgBmp = matToBitmap(comb)
-        val status = "src=$srcTag score=%.2f rect=%.2f ang=%.2f asp=%.2f size=%.2f border=%.2f edge=%.2f move=%.3f stable=%d/%d accept=%s".format(
-            bestScore, bestBrk.rectangularity, bestBrk.rightAngles, bestBrk.aspect,
-            bestBrk.size, bestBrk.border, bestBrk.edge, moveNorm, stableFrames, needStable, acceptForCrop
-        )
+        val dbgBmp = debugBitmapIfNeeded(comb)
+        val status =
+            "src=$srcTag score=%.2f rect=%.2f ang=%.2f asp=%.2f size=%.2f border=%.2f edge=%.2f move=%.3f stable=%d/%d accept=%s cont=%s".format(
+                bestScore,
+                bestBrk.rectangularity,
+                bestBrk.rightAngles,
+                bestBrk.aspect,
+                bestBrk.size,
+                bestBrk.border,
+                bestBrk.edge,
+                moveNorm,
+                stableFrames,
+                needStable,
+                qualityAccepted,
+                continuityAccepted,
+            )
 
         // release mats safely
         if (grayWork !== grayDownFull) grayWork.release()
@@ -386,7 +533,18 @@ class DocumentAnalyzerTwo(
         k3.release()
         grayDownFull.release()
 
-        return DetectOut(smoothed.toList(), cropped, dbgBmp, status)
+        return DetectOut(
+            polygon = if (qualityAccepted) {
+                smoothed.toList()
+            } else {
+                emptyList()
+            },
+            cropped = cropped,
+            debugBmp = dbgBmp,
+            status = status,
+            qualityAccepted = qualityAccepted,
+            confidence = bestScore,
+        )
     }
 
     // ---------- Scoring / utils ----------
@@ -409,7 +567,8 @@ class DocumentAnalyzerTwo(
     ): ScoreBreakdown {
         val rect = Imgproc.boundingRect(MatOfPoint(*quadWork))
         val aspect = rect.width.toDouble() / max(1.0, rect.height.toDouble())
-        val rectangularity = (contourAreaWork / max(1.0, rect.width.toDouble() * rect.height)).coerceIn(0.0, 1.0)
+        val rectangularity =
+            (contourAreaWork / max(1.0, rect.width.toDouble() * rect.height)).coerceIn(0.0, 1.0)
         val angScore = rightAngleScore(quadWork)
         val aspectNorm = normalizeAspect(aspect)
         val sizeNorm = (contourAreaWork / frameAreaWork).coerceIn(0.0, 1.0)
@@ -459,7 +618,13 @@ class DocumentAnalyzerTwo(
     }
 
     private data class Line(val a: Double, val b: Double, val c: Double)
-    private data class Seg(val x1: Double, val y1: Double, val x2: Double, val y2: Double, val angleDeg: Double) {
+    private data class Seg(
+        val x1: Double,
+        val y1: Double,
+        val x2: Double,
+        val y2: Double,
+        val angleDeg: Double
+    ) {
         val cx = (x1 + x2) * 0.5
         val cy = (y1 + y2) * 0.5
     }
@@ -468,12 +633,17 @@ class DocumentAnalyzerTwo(
         val lines = Mat()
         val minLen = min(w, h) * houghMinLineLenRatio
         Imgproc.HoughLinesP(edges, lines, 1.0, Math.PI / 180.0, 120, minLen, 10.0)
-        if (lines.empty()) { lines.release(); return null }
+        if (lines.empty()) {
+            lines.release(); return null
+        }
 
         val segs = ArrayList<Seg>(lines.rows())
         for (i in 0 until lines.rows()) {
             val v = lines.get(i, 0)
-            val x1 = v[0]; val y1 = v[1]; val x2 = v[2]; val y2 = v[3]
+            val x1 = v[0]
+            val y1 = v[1]
+            val x2 = v[2]
+            val y2 = v[3]
             val angleDeg = Math.toDegrees(atan2(y2 - y1, x2 - x1))
             segs.add(Seg(x1, y1, x2, y2, angleDeg))
         }
@@ -491,8 +661,10 @@ class DocumentAnalyzerTwo(
 
         if (horiz.size < 2 || vert.size < 2) return null
 
-        val top = horiz.first(); val bottom = horiz.last()
-        val left = vert.first(); val right = vert.last()
+        val top = horiz.first()
+        val bottom = horiz.last()
+        val left = vert.first()
+        val right = vert.last()
 
         val lTop = lineFromSegment(top)
         val lBottom = lineFromSegment(bottom)
@@ -504,7 +676,8 @@ class DocumentAnalyzerTwo(
         val br = intersect(lBottom, lRight) ?: return null
         val bl = intersect(lBottom, lLeft) ?: return null
 
-        fun inBounds(p: Point) = p.x >= -w * 0.2 && p.x <= w * 1.2 && p.y >= -h * 0.2 && p.y <= h * 1.2
+        fun inBounds(p: Point) =
+            p.x >= -w * 0.2 && p.x <= w * 1.2 && p.y >= -h * 0.2 && p.y <= h * 1.2
         if (!inBounds(tl) || !inBounds(tr) || !inBounds(br) || !inBounds(bl)) return null
 
         val quad = orderQuad(arrayOf(tl, tr, br, bl)).toTypedArray()
@@ -548,28 +721,69 @@ class DocumentAnalyzerTwo(
     }
 
     private fun reconstruct4thFromTriangle(tri: Array<Point>): Array<Point> {
-        val p0 = tri[0]; val p1 = tri[1]; val p2 = tri[2]
-        val l01 = lineAB(p0, p1)
-        val l12 = lineAB(p1, p2)
-        val l20 = lineAB(p2, p0)
-        val cands = listOfNotNull(intersect(l01, l12), intersect(l12, l20), intersect(l20, l01))
-        var bestQuad: Array<Point>? = null
-        var bestArea = -1.0
-        for (p in cands) {
-            val arr = arrayOf(p0, p1, p2, p)
-            val ordered = orderQuad(arr).toTypedArray()
-            val area = polygonArea(orderedList(ordered))
-            if (area > bestArea) { bestArea = area; bestQuad = ordered }
+        val p0 = tri[0]
+        val p1 = tri[1]
+        val p2 = tri[2]
+
+        val candidates = listOf(
+            Point(
+                p0.x + p1.x - p2.x,
+                p0.y + p1.y - p2.y,
+            ),
+            Point(
+                p0.x + p2.x - p1.x,
+                p0.y + p2.y - p1.y,
+            ),
+            Point(
+                p1.x + p2.x - p0.x,
+                p1.y + p2.y - p0.y,
+            ),
+        )
+
+        val bestCandidate = candidates
+            .mapNotNull { candidate ->
+                val ordered = orderQuad(
+                    arrayOf(p0, p1, p2, candidate),
+                ).toTypedArray()
+
+                if (!isUsableQuad(ordered)) {
+                    return@mapNotNull null
+                }
+
+                ordered to rightAngleScore(ordered)
+            }
+            .maxByOrNull { it.second }
+            ?.first
+
+        if (bestCandidate != null) {
+            return bestCandidate
         }
-        return bestQuad ?: minAreaRectToQuad(MatOfPoint(*tri))
+
+        val contour = MatOfPoint(*tri)
+
+        return minAreaRectToQuad(contour).also {
+            contour.release()
+        }
     }
 
-    private fun lineAB(a: Point, b: Point): Line {
-        val A = a.y - b.y
-        val B = b.x - a.x
-        val C = a.x * b.y - b.x * a.y
-        val norm = sqrt(A * A + B * B).coerceAtLeast(1e-6)
-        return Line(A / norm, B / norm, C / norm)
+    private fun isUsableQuad(quad: Array<Point>): Boolean {
+        if (quad.size != 4) return false
+
+        val minSideLength = (0 until 4)
+            .minOf { index ->
+                dist(
+                    quad[index],
+                    quad[(index + 1) % quad.size],
+                )
+            }
+
+        if (minSideLength < 3.0) return false
+
+        val contour = MatOfPoint(*quad)
+        val isConvex = Imgproc.isContourConvex(contour)
+        contour.release()
+
+        return isConvex && polygonArea(orderedList(quad)) > 1.0
     }
 
     private fun orderQuad(pts: Array<Point>): List<Point> {
@@ -585,13 +799,16 @@ class DocumentAnalyzerTwo(
 
     private fun rightAngleScore(quad: Array<Point>): Double {
         fun angle(a: Point, b: Point, c: Point): Double {
-            val abx = a.x - b.x; val aby = a.y - b.y
-            val cbx = c.x - b.x; val cby = c.y - b.y
+            val abx = a.x - b.x
+            val aby = a.y - b.y
+            val cbx = c.x - b.x
+            val cby = c.y - b.y
             val dot = abx * cbx + aby * cby
             val norm = sqrt((abx * abx + aby * aby) * (cbx * cbx + cby * cby)).coerceAtLeast(1e-6)
             val cos = (dot / norm).coerceIn(-1.0, 1.0)
             return Math.toDegrees(acos(cos))
         }
+
         val pts = orderQuad(quad)
         val angs = listOf(
             angle(pts[3], pts[0], pts[1]),
@@ -612,12 +829,21 @@ class DocumentAnalyzerTwo(
 
     private fun median(gray: Mat): Double {
         val hist = Mat()
-        Imgproc.calcHist(listOf(gray), MatOfInt(0), Mat(), hist, MatOfInt(256), MatOfFloat(0f, 256f))
+        Imgproc.calcHist(
+            listOf(gray),
+            MatOfInt(0),
+            Mat(),
+            hist,
+            MatOfInt(256),
+            MatOfFloat(0f, 256f)
+        )
         var acc = 0.0
         val total = gray.rows() * gray.cols().toDouble()
         for (i in 0 until 256) {
             acc += hist.get(i, 0)[0]
-            if (acc >= total / 2) { hist.release(); return i.toDouble() }
+            if (acc >= total / 2) {
+                hist.release(); return i.toDouble()
+            }
         }
         hist.release()
         return 127.0
@@ -626,17 +852,23 @@ class DocumentAnalyzerTwo(
     private fun polygonArea(quad: List<Point>): Double {
         var s = 0.0
         for (i in quad.indices) {
-            val a = quad[i]; val b = quad[(i + 1) % quad.size]
+            val a = quad[i]
+            val b = quad[(i + 1) % quad.size]
             s += a.x * b.y - b.x * a.y
         }
         return abs(s) * 0.5
     }
 
     private fun dist(a: Point, b: Point) = hypot(a.x - b.x, a.y - b.y)
-    private fun lerp(a: Point, b: Point, t: Double): Point = Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+
+    private fun lerp(a: Point, b: Point): Point =
+        Point(
+            a.x + (b.x - a.x) * alpha,
+            a.y + (b.y - a.y) * alpha,
+        )
 
     // ---------- Warp ----------
-    private fun warpByQuadBitmap(src: Bitmap, quad: Array<Point>): Bitmap? {
+    private fun warpByQuadBitmap(src: Bitmap, quad: Array<Point>): Bitmap {
         val widthTop = dist(quad[0], quad[1])
         val widthBottom = dist(quad[3], quad[2])
         val heightLeft = dist(quad[0], quad[3])
@@ -665,7 +897,7 @@ class DocumentAnalyzerTwo(
         return out
     }
 
-    private fun warpByQuadGray(srcGray: Mat, quad: Array<Point>): Bitmap? {
+    private fun warpByQuadGray(srcGray: Mat, quad: Array<Point>): Bitmap {
         val widthTop = dist(quad[0], quad[1])
         val widthBottom = dist(quad[3], quad[2])
         val heightLeft = dist(quad[0], quad[3])
@@ -708,17 +940,21 @@ class DocumentAnalyzerTwo(
         return bmp
     }
 
-    private fun makeThumbnail(b: Bitmap, width: Int): Bitmap {
-        val r = width.toFloat() / b.width
-        val h = (b.height * r).roundToInt()
-        return b.scale(width, h)
+    private fun makeThumbnail(b: Bitmap): Bitmap {
+        val scale = THUMBNAIL_WIDTH.toFloat() / b.width
+        val height = (b.height * scale).roundToInt()
+
+        return b.scale(
+            THUMBNAIL_WIDTH,
+            height,
+        )
     }
 
     // ---------- Post-process ----------
     private fun applyPostproc(bmp: Bitmap, profile: EnhanceProfile): Bitmap = when (profile) {
         EnhanceProfile.NONE -> bmp
         EnhanceProfile.SOFT -> enhanceSoft(bmp)
-        EnhanceProfile.BW   -> enhanceBW(bmp)
+        EnhanceProfile.BW -> enhanceBW(bmp)
     }
 
     private fun enhanceSoft(bmp: Bitmap): Bitmap {
@@ -869,5 +1105,52 @@ class DocumentAnalyzerTwo(
     // --- release helpers ---
     private fun releaseAll(contours: List<MatOfPoint>) {
         contours.forEach { c -> runCatching { c.release() }.onFailure { } }
+    }
+
+    private fun isCandidateConsistent(
+        currentQuad: Array<Point>,
+        previousQuad: Array<Point>?,
+        frameWidth: Int,
+        frameHeight: Int,
+    ): Boolean {
+        if (previousQuad == null) return true
+
+        val frameDiagonal = hypot(
+            frameWidth.toDouble(),
+            frameHeight.toDouble(),
+        ).coerceAtLeast(1.0)
+
+        val currentCenter = quadCenter(currentQuad)
+        val previousCenter = quadCenter(previousQuad)
+
+        val jump = dist(currentCenter, previousCenter) / frameDiagonal
+
+        val previousArea = polygonArea(
+            orderedList(previousQuad),
+        ).coerceAtLeast(1.0)
+
+        val currentArea = polygonArea(
+            orderedList(currentQuad),
+        ).coerceAtLeast(1.0)
+
+        val areaRatio = currentArea / previousArea
+
+        return jump <= maxTrackingJumpNorm &&
+                areaRatio in minTrackingAreaRatio..maxTrackingAreaRatio
+    }
+
+    private fun quadCenter(quad: Array<Point>): Point {
+        return Point(
+            quad.map { it.x }.average(),
+            quad.map { it.y }.average(),
+        )
+    }
+
+    private fun debugBitmapIfNeeded(mat: Mat): Bitmap? {
+        return if (frameIndex % debugEveryFrames == 0) {
+            matToBitmap(mat)
+        } else {
+            null
+        }
     }
 }
