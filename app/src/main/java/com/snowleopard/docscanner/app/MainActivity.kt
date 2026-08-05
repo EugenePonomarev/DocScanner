@@ -1,5 +1,6 @@
 package com.snowleopard.docscanner.app
 
+import android.annotation.SuppressLint
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -16,32 +17,56 @@ import org.koin.androidx.compose.koinViewModel
 import org.opencv.android.OpenCVLoader
 
 class MainActivity : ComponentActivity() {
+
+    @SuppressLint("UnrememberedGetBackStackEntry")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         enableEdgeToEdge()
-        val ok = OpenCVLoader.initLocal()
+
+        OpenCVLoader.initLocal()
 
         setContent {
             DocScannerTheme {
-                val nav = rememberNavController()
+                val navController = rememberNavController()
 
-                NavHost(navController = nav, startDestination = "camera") {
+                NavHost(
+                    navController = navController,
+                    startDestination = "camera",
+                ) {
                     composable("camera") {
-                        val vm: ScanViewModel = koinViewModel()
+                        val scanViewModel: ScanViewModel =
+                            koinViewModel()
+
                         CameraScreen(
-                            viewModel = vm,
-                            onOpenStack = { nav.navigate("stack") }
+                            viewModel = scanViewModel,
+                            onOpenStack = {
+                                navController.navigate("stack")
+                            },
                         )
                     }
+
                     composable("stack") {
-                        val vm: StackViewModel = koinViewModel()
+                        val stackViewModel: StackViewModel =
+                            koinViewModel()
+
+                        val cameraBackStackEntry =
+                            navController.getBackStackEntry("camera")
+
+                        val scanViewModel: ScanViewModel =
+                            koinViewModel(
+                                viewModelStoreOwner = cameraBackStackEntry,
+                            )
+
                         StackScreen(
-                            viewModel = vm,
-                            onBack = { nav.popBackStack() },
+                            viewModel = stackViewModel,
+                            onBack = {
+                                navController.popBackStack()
+                            },
                             onCloseAndClear = {
-                                vm.clearSession()
-                                nav.popBackStack()
-                            }
+                                scanViewModel.clearSession()
+                                navController.popBackStack()
+                            },
                         )
                     }
                 }
