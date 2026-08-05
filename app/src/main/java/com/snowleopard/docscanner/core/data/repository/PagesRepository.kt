@@ -13,6 +13,11 @@ import java.util.UUID
 import kotlin.math.max
 import kotlin.math.roundToInt
 
+private const val A4_WIDTH_POINTS = 595
+private const val A4_HEIGHT_POINTS = 842
+private const val POINTS_PER_INCH = 72f
+private const val MILLIMETERS_PER_INCH = 25.4f
+
 class PagesRepository(private val context: Context) {
 
     private var sessionDir: File = newSessionDir()
@@ -103,62 +108,104 @@ class PagesRepository(private val context: Context) {
 
     fun buildPdf(pages: List<ScannedPage>, options: PdfOptions): File {
         require(pages.isNotEmpty()) { "pages is empty" }
+        require(options.marginMm >= 0) { "marginMm must be non-negative" }
 
         val outDir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
-            ?: context.getExternalFilesDir(null)!!
-        if (!outDir.exists()) outDir.mkdirs()
+            ?: context.getExternalFilesDir(null)
+            ?: error("Documents directory is unavailable")
+
+        if (!outDir.exists() && !outDir.mkdirs()) {
+            error("Unable to create output directory")
+        }
+
+        val margin = mmToPoints(options.marginMm)
+
+        require(margin * 2 < A4_WIDTH_POINTS) {
+            "Margin is too large for A4 page"
+        }
 
         val outFile = File(outDir, "Scan_${System.currentTimeMillis()}.pdf")
         val pdf = PdfDocument()
 
-        val a4W = (8.27f * options.dpi).roundToInt()
-        val a4H = (11.69f * options.dpi).roundToInt()
-        val margin = mmToPx(options.marginMm, options.dpi)
+        try {
+            pages.forEachIndexed { index, page ->
+                val raw = BitmapFactory.decodeFile(page.file.absolutePath)
+                    ?: error("Unable to decode page: ${page.file.absolutePath}")
 
-        pages.forEachIndexed { idx, p ->
-            val raw = BitmapFactory.decodeFile(p.file.absolutePath) ?: return@forEachIndexed
+                var content = raw
 
-            val bmp = if (options.autoRotateToPortrait && raw.width > raw.height) {
-                rotate(raw, 90f)
-            } else raw
+                try {
+                    if (options.autoRotateToPortrait && raw.width > raw.height) {
+                        content = rotate(raw, 90f)
+                    }
 
-            val isPortrait = bmp.height >= bmp.width
-            val pageW = if (isPortrait) a4W else a4H
-            val pageH = if (isPortrait) a4H else a4W
+                    val isPortrait = content.height >= content.width
+                    val pageWidth = if (isPortrait) {
+                        A4_WIDTH_POINTS
+                    } else {
+                        A4_HEIGHT_POINTS
+                    }
+                    val pageHeight = if (isPortrait) {
+                        A4_HEIGHT_POINTS
+                    } else {
+                        A4_WIDTH_POINTS
+                    }
 
-            val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, idx + 1).create()
-            val page = pdf.startPage(pageInfo)
-            val canvas = page.canvas
+                    val contentWidth = pageWidth - margin * 2
+                    val contentHeight = pageHeight - margin * 2
 
-            canvas.drawColor(Color.WHITE)
+                    val bitmapScale = minOf(
+                        contentWidth.toFloat() / content.width,
+                        contentHeight.toFloat() / content.height,
+                    )
 
-            val cx = margin
-            val cy = margin
-            val cw = pageW - margin * 2
-            val ch = pageH - margin * 2
+                    val drawWidth = (content.width * bitmapScale).roundToInt()
+                    val drawHeight = (content.height * bitmapScale).roundToInt()
 
-            // Fit center
-            val br = minOf(cw.toFloat() / bmp.width, ch.toFloat() / bmp.height)
-            val dw = (bmp.width * br).roundToInt()
-            val dh = (bmp.height * br).roundToInt()
-            val dx = cx + (cw - dw) / 2
-            val dy = cy + (ch - dh) / 2
+                    val drawLeft = margin + (contentWidth - drawWidth) / 2f
+                    val drawTop = margin + (contentHeight - drawHeight) / 2f
 
-            val scaled = if (dw != bmp.width || dh != bmp.height)
-                bmp.scale(dw, dh) else bmp
+                    val pageInfo = PdfDocument.PageInfo.Builder(
+                        pageWidth,
+                        pageHeight,
+                        index + 1,
+                    ).create()
 
-            val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(scaled, dx.toFloat(), dy.toFloat(), paint)
+                    val pdfPage = pdf.startPage(pageInfo)
 
-            pdf.finishPage(page)
+                    pdfPage.canvas.drawColor(Color.WHITE)
+                    pdfPage.canvas.drawBitmap(
+                        content,
+                        null,
+                        RectF(
+                            drawLeft,
+                            drawTop,
+                            drawLeft + drawWidth,
+                            drawTop + drawHeight,
+                        ),
+                        Paint(Paint.FILTER_BITMAP_FLAG),
+                    )
 
-            if (scaled !== bmp) scaled.recycle()
-            if (bmp !== raw) bmp.recycle()
+                    pdf.finishPage(pdfPage)
+                } finally {
+                    if (content !== raw && !content.isRecycled) {
+                        content.recycle()
+                    }
+
+                    if (!raw.isRecycled) {
+                        raw.recycle()
+                    }
+                }
+            }
+
+            FileOutputStream(outFile).use { output ->
+                pdf.writeTo(output)
+            }
+
+            return outFile
+        } finally {
+            pdf.close()
         }
-
-        FileOutputStream(outFile).use { pdf.writeTo(it) }
-        pdf.close()
-        return outFile
     }
 
     // --- helpers ---
@@ -174,4 +221,6 @@ class PagesRepository(private val context: Context) {
     }
 
     private fun mmToPx(mm: Int, dpi: Int): Int = ((dpi.toFloat() * mm) / 25.4f).roundToInt()
+
+    private fun mmToPoints(mm: Int): Int = (mm * POINTS_PER_INCH / MILLIMETERS_PER_INCH).roundToInt()
 }
