@@ -2,8 +2,6 @@ package com.snowleopard.docscanner.feature.screens
 
 import android.content.Intent
 import android.net.Uri
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.TransformableState
@@ -65,8 +63,6 @@ fun StackScreen(
             offsetY += pan.y
         }
     }
-
-    val rotateAnim = remember { Animatable(0f) }
 
     Scaffold(
         topBar = {
@@ -195,16 +191,16 @@ fun StackScreen(
                             .data(page.file)
                             .memoryCacheKey("${page.file.absolutePath}:${page.width}x${page.height}:${page.file.lastModified()}")
                             .diskCacheKey("${page.file.absolutePath}:${page.width}x${page.height}:${page.file.lastModified()}")
-                            .crossfade(true)
                             .build(),
                         contentDescription = null,
                         modifier = Modifier
                             .fillMaxSize()
                             .transformable(transformState)
                             .graphicsLayer(
-                                rotationZ = rotateAnim.value,
-                                scaleX = scale, scaleY = scale,
-                                translationX = offsetX, translationY = offsetY
+                                scaleX = scale,
+                                scaleY = scale,
+                                translationX = offsetX,
+                                translationY = offsetY
                             )
                     )
                 }
@@ -241,12 +237,10 @@ fun StackScreen(
                         ) { Text("→") }
 
                         IconButton(onClick = {
-                            scope.launch {
-                                rotateAnim.snapTo(0f)
-                                rotateAnim.animateTo(90f, tween(durationMillis = 220))
-                                rotateAnim.snapTo(0f)
-                            }
-                            viewModel.rotatePage(selected, +90)
+                            viewModel.rotatePage(selected, 90)
+                            scale = 1f
+                            offsetX = 0f
+                            offsetY = 0f
                         }) {
                             Icon(Icons.Filled.Rotate90DegreesCw, contentDescription = stringResource(R.string.rotate))
                         }
